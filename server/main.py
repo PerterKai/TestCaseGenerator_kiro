@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Test Case Generator MCP Server v6.0
+Test Case Generator MCP Server v6.1
 - Phase-based workflow with file cache for cross-session resume
 - Splits document reading into summary + sections to reduce context
-- Session switch hints when image batch threshold reached
 - All state persisted to .tmp/cache/ for recovery
+- v6.1: Fix VML image discovery (w:object), extension-free IDs, unique dup placeholders
 """
 
 import sys
@@ -1961,7 +1961,7 @@ def handle_request(req):
         send_response(rid, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "testcase-generator", "version": "6.0.0"}
+            "serverInfo": {"name": "testcase-generator", "version": "6.1.0"}
         })
     elif method == "notifications/initialized":
         pass
@@ -1990,7 +1990,7 @@ def handle_request(req):
 
 
 def main():
-    sys.stderr.write("TestCase Generator MCP Server v6.0 starting...\n")
+    sys.stderr.write("TestCase Generator MCP Server v6.1 starting...\n")
     sys.stderr.flush()
 
     while True:
