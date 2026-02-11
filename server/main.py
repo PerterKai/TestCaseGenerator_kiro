@@ -966,7 +966,6 @@ def handle_setup_environment(args):
 
 def handle_clear_cache(args):
     """Clear all cached task data for a fresh start."""
-    workspace = _workspace()
     cleared = []
 
     # Clear cache files
@@ -1550,7 +1549,15 @@ def handle_save_testcases(args):
         )}]}
 
     if modules is None:
-        return {"content": [{"type": "text", "text": "Missing parameter: modules or append_module. 必须提供 modules（全量数组）或 append_module（单个模块对象）之一。"}]}
+        return {"content": [{"type": "text", "text": (
+            "Missing parameter: modules or append_module.\n"
+            "必须提供 modules（全量数组）或 append_module（单个模块对象）之一。\n\n"
+            "⚠️ 如果你正在尝试全量替换但数据量太大导致参数丢失，请改用 append_module 逐个模块更新：\n"
+            "  1. 调用 get_testcases 获取当前用例\n"
+            "  2. 对需要修改的模块，逐个调用 save_testcases(append_module={修改后的单个模块对象})\n"
+            "  3. append_module 会自动按模块名替换已有模块\n"
+            "  4. 不需要修改的模块无需重新提交"
+        )}]}
 
     if not isinstance(modules, list):
         return {"content": [{"type": "text", "text": "Error: modules must be a JSON array."}]}

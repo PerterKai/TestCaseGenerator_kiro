@@ -108,7 +108,8 @@ keywords:
 3. 每读取一个模块的内容，就生成该模块的测试用例
 4. 调用 `save_testcases(append_module=该模块的完整JSON对象)` 增量保存每个模块的用例
    - **`save_testcases` 必须提供 `modules`（全量数组）或 `append_module`（单个模块对象）之一，不能都不传**
-   - 生成阶段用 `append_module`（单个模块对象，非数组）；Review 阶段用 `modules`（全量替换）
+   - **始终优先使用 `append_module`**（单个模块对象，非数组），按模块名自动替换已有模块
+   - `modules`（全量替换）仅在模块数量极少（≤3个）时使用，大量用例时禁止使用以避免参数截断
 5. 重复直到所有模块处理完毕
 6. 调用 `get_testcases` 确认用例完整性
 
@@ -126,12 +127,14 @@ keywords:
 - 检查子模块粒度是否合适
 - 检查用例质量（前置条件、步骤、预期结果是否完整）
 
-根据审查结果调整模块结构，调整后调用 `save_testcases(modules=调整后的全部用例数组)` 保存。
+根据审查结果调整模块结构，对需要调整的模块逐个调用 `save_testcases(append_module=调整后的单个模块对象)` 保存。
 
 ### 步骤 5: 自动 Review 与迭代
 1. 调用 `get_testcases` 获取当前所有用例
 2. 审查功能覆盖、边界条件、异常场景、步骤可执行性
-3. 修改后调用 `save_testcases(modules=修改后的全部用例数组)` 保存（Review 阶段用 `modules` 全量替换）
+3. 对需要修改的模块，逐个调用 `save_testcases(append_module=修改后的单个模块对象)` 保存
+   - **Review 阶段也使用 `append_module` 逐模块更新**，按模块名自动替换，避免全量提交导致参数截断
+   - 不需要修改的模块无需重新提交
 4. 重复 1-3，迭代 2-3 轮
 5. 在 Review 过程中，记录发现的需求疑问点和确认项
 
@@ -165,3 +168,4 @@ keywords:
 - 如果遇到缓存状态不一致，可以调用 `clear_cache` 清除缓存重新开始
 - `append_module` 支持同名模块替换，不会产生重复
 - `save_testcases` 的 `append_module` 参数必须是单个模块对象（非数组），`modules` 参数必须是数组
+- **始终优先使用 `append_module` 逐模块保存**，`modules` 全量替换仅在模块极少（≤3个）时使用，大量用例时会因参数过大导致截断失败
