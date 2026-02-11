@@ -2,7 +2,7 @@
   "mcpServers": {
     "testcase-generator": {
       "command": "python",
-      "args": ["testcase-mcp-server/main.py"],
+      "args": ["server/main.py"],
       "env": {
         "PYTHONIOENCODING": "utf-8"
       },
