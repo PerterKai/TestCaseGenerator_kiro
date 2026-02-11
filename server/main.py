@@ -69,6 +69,12 @@ def send_error(rid, code, message):
 # Constants & Paths
 # ============================================================
 
+# Cache file names
+CACHE_PHASE_STATE = "phase_state.json"
+CACHE_IMAGE_PROGRESS = "image_progress.json"
+CACHE_TESTCASES = "testcases.json"
+CACHE_DOC_SUMMARY = "doc_summary.json"
+
 # Resolve workspace root: Kiro sets cwd to workspace root when launching MCP.
 # Also support --workspace CLI arg for manual runs.
 def _resolve_initial_workspace():
@@ -130,7 +136,7 @@ def _load_cache(filename, default=None):
 
 def _save_phase_state(phase, status, extra=None):
     """Update phase_state.json with current progress."""
-    state = _load_cache("phase_state.json", {
+    state = _load_cache(CACHE_PHASE_STATE, {
         "current_phase": phase,
         "workspace_dir": _workspace(),
         "phases": {}
@@ -143,7 +149,7 @@ def _save_phase_state(phase, status, extra=None):
     state["phases"][phase]["status"] = status
     if extra:
         state["phases"][phase].update(extra)
-    _save_cache("phase_state.json", state)
+    _save_cache(CACHE_PHASE_STATE, state)
     return state
 
 
@@ -154,7 +160,7 @@ def _reset_phase_state():
         "workspace_dir": _workspace(),
         "phases": {}
     }
-    _save_cache("phase_state.json", state)
+    _save_cache(CACHE_PHASE_STATE, state)
     return state
 
 # ============================================================
@@ -609,24 +615,24 @@ testcase_store = {
 
 def _sync_store_to_cache():
     """Persist critical store data to cache files."""
-    _save_cache("image_progress.json", {
+    _save_cache(CACHE_IMAGE_PROGRESS, {
         "pending_images": testcase_store["pending_images"],
         "md_files": testcase_store["md_files"],
     })
     # Always write testcases (even empty) to avoid stale cache
-    _save_cache("testcases.json", {
+    _save_cache(CACHE_TESTCASES, {
         "modules": testcase_store["modules"],
     })
 
 
 def _restore_store_from_cache():
     """Restore store from cache files (for session resume)."""
-    img_data = _load_cache("image_progress.json")
+    img_data = _load_cache(CACHE_IMAGE_PROGRESS)
     if img_data:
         testcase_store["pending_images"] = img_data.get("pending_images", [])
         testcase_store["md_files"] = img_data.get("md_files", [])
 
-    tc_data = _load_cache("testcases.json")
+    tc_data = _load_cache(CACHE_TESTCASES)
     if tc_data:
         testcase_store["modules"] = tc_data.get("modules", [])
 
@@ -708,7 +714,7 @@ def _build_doc_summary():
         summary["total_sections"] += len(sections)
 
     # Also save to cache
-    _save_cache("doc_summary.json", summary)
+    _save_cache(CACHE_DOC_SUMMARY, summary)
     return summary
 
 # ============================================================
@@ -958,7 +964,7 @@ def handle_setup_environment(args):
     # 3. Check for cached tasks
     has_cache = False
     cache_info = {}
-    existing_state = _load_cache("phase_state.json")
+    existing_state = _load_cache(CACHE_PHASE_STATE)
     if existing_state and existing_state.get("phases"):
         has_cache = True
         # Gather cache details
@@ -1007,7 +1013,7 @@ def handle_clear_cache(args):
     cleared = []
 
     # Clear cache files
-    for cache_file in ("phase_state.json", "image_progress.json", "testcases.json", "doc_summary.json"):
+    for cache_file in (CACHE_PHASE_STATE, CACHE_IMAGE_PROGRESS, CACHE_TESTCASES, CACHE_DOC_SUMMARY):
         cache_fp = _cache_path(cache_file)
         if os.path.exists(cache_fp):
             os.remove(cache_fp)
@@ -1048,7 +1054,7 @@ def handle_parse_documents(args):
 
     # Protection: check if there's an in-progress workflow
     if not force:
-        existing_state = _load_cache("phase_state.json")
+        existing_state = _load_cache(CACHE_PHASE_STATE)
         if existing_state:
             phases = existing_state.get("phases", {})
             img_phase = phases.get("image_analysis", {})
@@ -1075,7 +1081,7 @@ def handle_parse_documents(args):
     os.makedirs(TMP_CACHE_DIR, exist_ok=True)
 
     # Reset all cache state files when re-parsing
-    for cache_file in ("phase_state.json", "image_progress.json", "testcases.json", "doc_summary.json"):
+    for cache_file in (CACHE_PHASE_STATE, CACHE_IMAGE_PROGRESS, CACHE_TESTCASES, CACHE_DOC_SUMMARY):
         cache_fp = _cache_path(cache_file)
         if os.path.exists(cache_fp):
             os.remove(cache_fp)
@@ -1360,7 +1366,7 @@ def handle_get_workflow_state(args):
     # Try to restore from cache
     _restore_store_from_cache()
 
-    state = _load_cache("phase_state.json")
+    state = _load_cache(CACHE_PHASE_STATE)
     if not state:
         return {"content": [{"type": "text", "text": "没有找到已保存的工作流状态。请从 parse_documents 开始新的工作流。"}],
                 "has_state": False}
@@ -1720,7 +1726,6 @@ def handle_review_module_structure(args):
         stats.append(f"  📦 {m['name']}: {len(m.get('sub_modules', []))} 子模块, {total} 用例")
 
     if module_sizes:
-        sizes = [s for _, s in module_sizes]
         max_name, max_size = max(module_sizes, key=lambda x: x[1])
         min_name, min_size = min(module_sizes, key=lambda x: x[1])
 
