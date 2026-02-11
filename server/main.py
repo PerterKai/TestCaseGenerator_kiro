@@ -747,7 +747,12 @@ def create_xmind_file(modules, output_path):
 TOOLS = [
     {
         "name": "setup_environment",
-        "description": "Check and auto-install Python dependencies (python-docx, Pillow). No OCR needed.",
+        "description": "启动检查: 1) 检查并安装Python依赖 2) 检查并创建工作目录(doc/, .tmp/doc_mk/, .tmp/picture/, .tmp/cache/) 3) 检测缓存任务。如检测到缓存任务，返回 has_cache=true 和缓存详情，agent 需询问用户是继续上次任务还是开始新任务。",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "clear_cache",
+        "description": "清除所有缓存任务数据(.tmp/cache/下的所有状态文件、.tmp/doc_mk/下的markdown文件、.tmp/picture/下的图片)，用于开始全新的用例生成任务。调用前应先确认用户意图。",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
@@ -871,10 +876,13 @@ TOOLS = [
 # Tool Handlers
 # ============================================================
 
+
 def handle_setup_environment(args):
     results = []
     all_ok = True
     results.append(f"Python {sys.version.split()[0]}")
+
+    # 1. Check Python dependencies
     deps = {"docx": "python-docx", "PIL": "Pillow"}
     for imp, pip_name in deps.items():
         try:
@@ -887,9 +895,108 @@ def handle_setup_environment(args):
             else:
                 results.append(f"  [FAIL] {pip_name}")
                 all_ok = False
+
+    # 2. Ensure working directories exist
+    workspace = _workspace()
+    dirs_to_check = {
+        "doc": os.path.join(workspace, "doc"),
+        ".tmp/doc_mk": TMP_DOC_DIR,
+        ".tmp/picture": TMP_PIC_DIR,
+        ".tmp/cache": TMP_CACHE_DIR,
+    }
+    results.append("")
+    results.append("工作目录检查:")
+    for label, dir_path in dirs_to_check.items():
+        if os.path.isdir(dir_path):
+            results.append(f"  [ok] {label}/")
+        else:
+            try:
+                os.makedirs(dir_path, exist_ok=True)
+                results.append(f"  [created] {label}/")
+            except Exception as e:
+                results.append(f"  [FAIL] {label}/ — {e}")
+                all_ok = False
+
+    # 3. Check for cached tasks
+    has_cache = False
+    cache_info = {}
+    existing_state = _load_cache("phase_state.json")
+    if existing_state and existing_state.get("phases"):
+        has_cache = True
+        # Gather cache details
+        _restore_store_from_cache()
+        pending = testcase_store.get("pending_images", [])
+        total_imgs = len(pending)
+        processed_imgs = sum(1 for p in pending if p["processed"])
+        modules = testcase_store.get("modules", [])
+        total_cases = sum(len(s.get("test_cases", [])) for m in modules for s in m.get("sub_modules", []))
+        current_phase = existing_state.get("current_phase", "unknown")
+
+        cache_info = {
+            "current_phase": current_phase,
+            "total_images": total_imgs,
+            "processed_images": processed_imgs,
+            "unprocessed_images": total_imgs - processed_imgs,
+            "module_count": len(modules),
+            "total_cases": total_cases,
+        }
+        results.append("")
+        results.append("⚠️ 检测到缓存任务:")
+        results.append(f"  当前阶段: {current_phase}")
+        if total_imgs > 0:
+            results.append(f"  图片处理: {processed_imgs}/{total_imgs}")
+        if modules:
+            results.append(f"  已生成用例: {len(modules)} 模块, {total_cases} 用例")
+        results.append("")
+        results.append("请询问用户:")
+        results.append("  1. 继续上次任务 — 调用 get_workflow_state 恢复进度")
+        results.append("  2. 开始新任务 — 调用 clear_cache 清除缓存后开始新的用例生成")
+
     results.append("")
     results.append("OK - environment ready" if all_ok else "WARN - some deps failed")
-    return {"content": [{"type": "text", "text": "\n".join(results)}], "all_ok": all_ok}
+    return {
+        "content": [{"type": "text", "text": "\n".join(results)}],
+        "all_ok": all_ok,
+        "has_cache": has_cache,
+        "cache_info": cache_info,
+    }
+
+
+
+
+def handle_clear_cache(args):
+    """Clear all cached task data for a fresh start."""
+    workspace = _workspace()
+    cleared = []
+
+    # Clear cache files
+    for cache_file in ("phase_state.json", "image_progress.json", "testcases.json", "doc_summary.json"):
+        cache_fp = _cache_path(cache_file)
+        if os.path.exists(cache_fp):
+            os.remove(cache_fp)
+            cleared.append(cache_file)
+
+    # Clear generated markdown files
+    if os.path.isdir(TMP_DOC_DIR):
+        shutil.rmtree(TMP_DOC_DIR)
+        os.makedirs(TMP_DOC_DIR, exist_ok=True)
+        cleared.append(".tmp/doc_mk/*")
+
+    # Clear extracted images
+    if os.path.isdir(TMP_PIC_DIR):
+        shutil.rmtree(TMP_PIC_DIR)
+        os.makedirs(TMP_PIC_DIR, exist_ok=True)
+        cleared.append(".tmp/picture/*")
+
+    # Reset in-memory store
+    testcase_store["modules"] = []
+    testcase_store["pending_images"] = []
+    testcase_store["md_files"] = []
+    testcase_store["session_image_count"] = 0
+
+    msg = "✓ 缓存已清除:\n  " + "\n  ".join(cleared) if cleared else "没有需要清除的缓存。"
+    msg += "\n\n可以开始新的用例生成任务了。请确认文档已放入 doc/ 目录，然后调用 parse_documents 开始。"
+    return {"content": [{"type": "text", "text": msg}]}
 
 
 def handle_parse_documents(args):
@@ -1779,6 +1886,7 @@ def handle_export_xmind(args):
 
 HANDLERS = {
     "setup_environment": handle_setup_environment,
+    "clear_cache": handle_clear_cache,
     "parse_documents": handle_parse_documents,
     "get_pending_image": handle_get_pending_image,
     "submit_image_result": handle_submit_image_result,

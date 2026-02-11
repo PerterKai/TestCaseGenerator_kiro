@@ -12,6 +12,7 @@
       "disabled": false,
       "autoApprove": [
         "setup_environment",
+        "clear_cache",
         "parse_documents",
         "get_pending_image",
         "submit_image_result",
