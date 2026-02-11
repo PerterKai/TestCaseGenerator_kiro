@@ -75,10 +75,20 @@ CACHE_TESTCASES = "testcases.json"
 CACHE_DOC_SUMMARY = "doc_summary.json"
 
 def _resolve_initial_workspace():
-    """Determine workspace root directory at startup."""
+    """Determine workspace root directory at startup.
+    
+    Priority:
+    1. --workspace CLI arg (set by launcher in mcp.json)
+    2. KIRO_WORKSPACE env var (if Kiro sets it)
+    3. cwd (fallback, may not be correct when running as installed power)
+    """
     for i, arg in enumerate(sys.argv):
         if arg == "--workspace" and i + 1 < len(sys.argv):
             return os.path.abspath(sys.argv[i + 1])
+    # Try env var
+    env_ws = os.environ.get("KIRO_WORKSPACE")
+    if env_ws and os.path.isdir(env_ws):
+        return os.path.abspath(env_ws)
     return os.getcwd()
 
 _INITIAL_WORKSPACE = _resolve_initial_workspace()
@@ -99,6 +109,22 @@ def _update_workspace(directory):
 
 def _workspace():
     return WORKSPACE_DIR or _INITIAL_WORKSPACE
+
+
+def _resolve_md_path(md_info):
+    """Resolve full path for a markdown file entry."""
+    # Support both old format (with 'path') and new format (filename only)
+    if "path" in md_info and os.path.isfile(md_info["path"]):
+        return md_info["path"]
+    return os.path.join(TMP_DOC_DIR, md_info["name"])
+
+
+def _resolve_img_path(img_info):
+    """Resolve full path for an image file entry."""
+    # Support both old format (with 'path') and new format (filename only)
+    if "path" in img_info and os.path.isfile(img_info["path"]):
+        return img_info["path"]
+    return os.path.join(TMP_PIC_DIR, img_info["filename"])
 
 # ============================================================
 # Cache / Persistence Layer
@@ -640,7 +666,10 @@ def _sync_store_to_cache():
 
 
 def _restore_store_from_cache():
-    """Restore store from cache files (for session resume)."""
+    """Restore store from cache files (for session resume).
+    
+    Handles both old format (absolute 'path' field) and new format (filename only).
+    """
     img_data = _load_cache(CACHE_IMAGE_PROGRESS)
     if img_data:
         testcase_store["pending_images"] = img_data.get("pending_images", [])
@@ -703,7 +732,7 @@ def _build_doc_summary():
 
     for md_info in md_files:
         try:
-            with open(md_info["path"], 'r', encoding='utf-8') as f:
+            with open(_resolve_md_path(md_info), 'r', encoding='utf-8') as f:
                 content = f.read()
         except Exception:
             continue
@@ -1097,7 +1126,8 @@ def handle_parse_documents(args):
             md_path = os.path.join(TMP_DOC_DIR, md_filename)
             with open(md_path, 'w', encoding='utf-8') as f:
                 f.write(md_text)
-            all_md_files.append({"name": md_filename, "path": md_path})
+            # Store only filename, resolve full path dynamically via _workspace()
+            all_md_files.append({"name": md_filename})
 
             skipped = 0
             for img_id, (img_data, ext) in image_data_map.items():
@@ -1118,7 +1148,6 @@ def handle_parse_documents(args):
                 all_pending_images.append({
                     "id": img_id, 
                     "filename": img_filename, 
-                    "path": img_path,
                     "mime": mime, 
                     "size": len(img_data), 
                     "source_doc": doc_name,
@@ -1212,11 +1241,12 @@ def handle_get_pending_image(args):
     remaining = total - processed - 1
 
     try:
-        with open(next_img["path"], 'rb') as f:
+        img_path = _resolve_img_path(next_img)
+        with open(img_path, 'rb') as f:
             img_data = f.read()
         b64 = base64.b64encode(img_data).decode('ascii')
     except Exception as e:
-        return {"content": [{"type": "text", "text": f"Error reading image {next_img['path']}: {e}"}]}
+        return {"content": [{"type": "text", "text": f"Error reading image {next_img.get('filename', next_img.get('path', '?'))}: {e}"}]}
 
     # Include position context in the prompt
     pos_info = next_img.get("position", {})
@@ -1578,7 +1608,7 @@ def handle_get_doc_section(args):
     md_path = None
     for md_info in md_files:
         if md_info["name"] == doc_name or doc_name in md_info["name"]:
-            md_path = md_info["path"]
+            md_path = _resolve_md_path(md_info)
             break
 
     if not md_path:
@@ -1648,7 +1678,8 @@ def handle_get_parsed_markdown(args):
 
     for md_info in md_files:
         try:
-            with open(md_info["path"], 'r', encoding='utf-8') as f:
+            resolved_path = _resolve_md_path(md_info)
+            with open(resolved_path, 'r', encoding='utf-8') as f:
                 md_content = f.read()
             total_chars += len(md_content)
             content_parts.append({
@@ -1656,7 +1687,7 @@ def handle_get_parsed_markdown(args):
                 "text": f"\n{'='*60}\nFILE: {md_info['name']}\n{'='*60}\n\n{md_content}"
             })
         except Exception as e:
-            content_parts.append({"type": "text", "text": f"Error reading {md_info['path']}: {e}"})
+            content_parts.append({"type": "text", "text": f"Error reading {md_info['name']}: {e}"})
 
     summary = f"\n共 {len(md_files)} 个文档 ({total_chars} 字符)。"
     if total_chars > 30000:
@@ -1952,6 +1983,14 @@ def handle_request(req):
 
     sys.stderr.write(f"[MCP] Received: method={method} id={rid}\n")
     sys.stderr.flush()
+
+    # Ensure workspace is set from cache if not yet initialized
+    if WORKSPACE_DIR is None:
+        cached_state = _load_cache(CACHE_PHASE_STATE)
+        if cached_state and cached_state.get("workspace_dir"):
+            cached_ws = cached_state["workspace_dir"]
+            if os.path.isdir(cached_ws):
+                _update_workspace(cached_ws)
 
     if method == "initialize":
         send_response(rid, {

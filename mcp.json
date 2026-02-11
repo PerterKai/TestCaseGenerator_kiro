@@ -16,6 +16,7 @@
         "parse_documents",
         "get_pending_image",
         "submit_image_result",
+        "verify_image_positions",
         "get_workflow_state",
         "get_doc_summary",
         "get_doc_section",
