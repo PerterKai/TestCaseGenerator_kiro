@@ -1229,9 +1229,12 @@ def handle_get_pending_image(args):
         f"分析完成后调用 submit_image_result(image_id=\"{next_img['id']}\", analysis=\"你的分析结果\")"
     )
 
+    # Put image FIRST in content array, then text instructions.
+    # Some MCP clients only process image content when it appears before text.
     content_parts = [
+        {"type": "image", "data": b64, "mimeType": next_img["mime"]},
         {"type": "text", "text": text_info},
-        {"type": "image", "data": b64, "mimeType": next_img["mime"]}
+        {"type": "text", "text": f"\n图片文件路径: {next_img['path']}\n"}
     ]
 
     result = {
