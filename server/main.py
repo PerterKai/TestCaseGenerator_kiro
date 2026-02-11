@@ -603,6 +603,7 @@ testcase_store = {
     "pending_images": [],
     "md_files": [],
     "session_image_count": 0,  # images processed in current session (not persisted)
+    "_current_image_id": None,  # lock: tracks which image is currently being analyzed
 }
 
 
@@ -1178,6 +1179,19 @@ def handle_get_pending_image(args):
     if not pending:
         return {"content": [{"type": "text", "text": "No documents parsed yet. Call parse_documents first."}]}
 
+    # Concurrency guard: reject if a previous image hasn't been submitted yet
+    current_lock = testcase_store.get("_current_image_id")
+    if current_lock:
+        # Check if the locked image is still unprocessed
+        for img in pending:
+            if img["id"] == current_lock and not img["processed"]:
+                return {"content": [{"type": "text", "text": (
+                    f"⚠️ 图片 {current_lock} 正在等待分析结果提交。\n"
+                    f"请先调用 submit_image_result(image_id=\"{current_lock}\", analysis=\"...\") 提交当前图片的分析结果，"
+                    f"然后再获取下一张图片。\n"
+                    f"⚠️ 严禁并发处理多张图片，必须严格按照 get → submit → get → submit 的顺序逐张处理。"
+                )}]}
+
     next_img = None
     for img in pending:
         if not img["processed"]:
@@ -1185,17 +1199,22 @@ def handle_get_pending_image(args):
             break
 
     if next_img is None:
+        testcase_store["_current_image_id"] = None
         _save_phase_state("image_analysis", "completed")
         return {
             "content": [{"type": "text", "text": "所有图片已处理完毕！请调用 get_doc_summary 获取文档结构概览，然后按模块调用 get_doc_section 分段读取内容生成测试用例。"}],
             "all_processed": True
         }
 
+    # Set the lock — only this image can be submitted until done
+    testcase_store["_current_image_id"] = next_img["id"]
+
     try:
         with open(next_img["path"], 'rb') as f:
             img_data = f.read()
         b64 = base64.b64encode(img_data).decode('ascii')
     except Exception as e:
+        testcase_store["_current_image_id"] = None  # Release lock on error
         return {"content": [{"type": "text", "text": f"Error reading image {next_img['path']}: {e}"}]}
 
     total = len(pending)
@@ -1204,6 +1223,8 @@ def handle_get_pending_image(args):
 
     text_info = (
         f"[{processed + 1}/{total}] 图片ID: {next_img['id']}\n\n"
+        f"⚠️ 重要：你必须且只能为这张图片（ID: {next_img['id']}）提交分析结果。\n"
+        f"在提交之前，不要调用 get_pending_image 获取其他图片。\n\n"
         f"{IMAGE_ANALYSIS_PROMPT}\n\n"
         f"分析完成后调用 submit_image_result(image_id=\"{next_img['id']}\", analysis=\"你的分析结果\")"
     )
@@ -1237,6 +1258,15 @@ def handle_submit_image_result(args):
         return {"content": [{"type": "text", "text": "Missing required parameter: image_id"}]}
     if not analysis:
         return {"content": [{"type": "text", "text": "Missing required parameter: analysis"}]}
+
+    # Concurrency guard: verify the submitted image_id matches the locked one
+    current_lock = testcase_store.get("_current_image_id")
+    if current_lock and image_id != current_lock:
+        return {"content": [{"type": "text", "text": (
+            f"❌ 提交的 image_id={image_id} 与当前正在处理的图片 {current_lock} 不匹配！\n"
+            f"请确认你提交的是当前图片的分析结果。\n"
+            f"当前应提交: submit_image_result(image_id=\"{current_lock}\", analysis=\"...\")"
+        )}]}
 
     pending = testcase_store.get("pending_images", [])
     if not pending:
@@ -1295,6 +1325,8 @@ def handle_submit_image_result(args):
     # Persist progress
     _sync_store_to_cache()
     testcase_store["session_image_count"] += 1
+    # Release the concurrency lock — allow next get_pending_image call
+    testcase_store["_current_image_id"] = None
     _save_phase_state("image_analysis", "in_progress", {
         "total": len(pending),
         "processed": sum(1 for p in pending if p["processed"]),
