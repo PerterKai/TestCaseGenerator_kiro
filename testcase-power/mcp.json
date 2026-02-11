@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "testcase-generator": {
+      "command": "C:\\Users\\xpeng\\Desktop\\Project\\TestCaseGenerator\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\Users\\xpeng\\Desktop\\Project\\TestCaseGenerator\\testcase-mcp-server\\main.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "disabled": false,
+      "autoApprove": [
+        "setup_environment",
+        "parse_documents",
+        "get_pending_image",
+        "submit_image_result",
+        "get_workflow_state",
+        "get_doc_summary",
+        "get_doc_section",
+        "get_parsed_markdown",
+        "save_testcases",
+        "get_testcases",
+        "export_xmind"
+      ]
+    }
+  }
+}
