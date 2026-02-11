@@ -1219,33 +1219,33 @@ def handle_get_pending_image(args):
     processed = sum(1 for p in pending if p["processed"])
     remaining = total - processed - 1
 
-    # Convert absolute path to relative path for agent to read
-    rel_path = next_img["path"]
+    # Read image and encode as base64
     try:
-        rel_path = os.path.relpath(next_img["path"], os.getcwd())
-    except:
-        pass
+        with open(next_img["path"], 'rb') as f:
+            img_data = f.read()
+        b64 = base64.b64encode(img_data).decode('ascii')
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"Error reading image {next_img['path']}: {e}"}]}
 
     text_info = (
         f"[{processed + 1}/{total}] 图片ID: {next_img['id']}\n\n"
         f"⚠️ 重要：你必须且只能为这张图片（ID: {next_img['id']}）提交分析结果。\n"
         f"在提交之前，不要调用 get_pending_image 获取其他图片。\n\n"
-        f"📁 图片路径: {rel_path}\n"
-        f"请使用 readFile 工具读取此图片进行分析。\n\n"
         f"{IMAGE_ANALYSIS_PROMPT}\n\n"
         f"分析完成后调用 submit_image_result(image_id=\"{next_img['id']}\", analysis=\"你的分析结果\")"
     )
 
-    remaining_text = f"\n提交后还剩 {remaining} 张待处理。" if remaining > 0 else ""
-
     content_parts = [
-        {"type": "text", "text": text_info + remaining_text}
+        {"type": "text", "text": text_info},
+        {"type": "image", "data": b64, "mimeType": next_img["mime"]}
     ]
+
+    if remaining > 0:
+        content_parts.append({"type": "text", "text": f"提交后还剩 {remaining} 张待处理。"})
 
     result = {
         "content": content_parts,
         "image_id": next_img["id"],
-        "image_path": rel_path,
         "total_images": total,
         "processed_count": processed,
         "remaining": remaining + 1,
