@@ -50,14 +50,17 @@ inclusion: manual
 ### 阶段2.5: 图片处理（仅"文档+图片模式"）
 逐一处理每张图片（每次只处理一张）：
    a. 调用 `get_pending_image` 获取下一张待处理图片
-   b. 模型自动判断图片类型，从测试视角提取具体内容：
+   b. 工具返回包含 base64 图片数据的 image content 和图片的工作区相对路径（`image_path` 字段）
+   c. 如果能直接看到图片（MCP image content 被正确传递），直接分析图片内容
+   d. 如果看不到图片（只收到文本），通过返回的 `image_path`（如 `.tmp/picture/xxx.png`）读取图片文件进行分析
+   e. 模型自动判断图片类型，从测试视角提取具体内容：
       - 数据表/字段定义 → 逐行提取：字段名、类型、长度、必填、默认值、描述
       - 流程图/状态图 → 列出所有节点、转换条件、每条分支路径
       - ER图/架构图 → 列出所有实体、属性、关系、外键
       - UI截图/原型图 → 列出表单字段、按钮、下拉选项、表格列头
       - 接口/参数定义 → 逐个提取参数名、类型、必填、取值范围、描述
-   c. 调用 `submit_image_result(image_id, analysis)` 提交结果
-   d. 重复直到所有图片处理完毕
+   f. 调用 `submit_image_result(image_id, analysis)` 提交结果
+   g. 重复直到所有图片处理完毕
 
    **跨 session 恢复**: 所有图片处理进度自动持久化到 `.tmp/cache/`。
    如果系统触发新 session，在新会话中调用 `setup_environment` 即可检测缓存并恢复进度。

@@ -1072,10 +1072,13 @@ def handle_parse_documents(args):
                 out_ext = ".png" if "png" in mime else ".jpg"
                 img_filename = os.path.splitext(img_id)[0] + out_ext
                 img_path = os.path.join(TMP_PIC_DIR, img_filename)
+                # Store relative path for cross-workspace portability
+                img_rel_path = os.path.join(".tmp", "picture", img_filename)
                 with open(img_path, 'wb') as f:
                     f.write(resized_data)
                 all_pending_images.append({
-                    "id": img_id, "filename": img_filename, "path": img_path,
+                    "id": img_id, "filename": img_filename,
+                    "path": img_path, "rel_path": img_rel_path,
                     "mime": mime, "size": len(img_data), "source_doc": doc_name,
                     "processed": False
                 })
@@ -1154,19 +1157,39 @@ def handle_get_pending_image(args):
             "all_processed": True
         }
 
+    # Resolve image file path: try absolute path first, then relative path from workspace
+    img_file_path = next_img["path"]
+    rel_path = next_img.get("rel_path", os.path.join(".tmp", "picture", next_img["filename"]))
+    if not os.path.exists(img_file_path):
+        # Fallback: reconstruct from workspace + relative path
+        img_file_path = os.path.join(_workspace(), rel_path)
+    if not os.path.exists(img_file_path):
+        # Last resort: try TMP_PIC_DIR directly
+        img_file_path = os.path.join(TMP_PIC_DIR, next_img["filename"])
+
     try:
-        with open(next_img["path"], 'rb') as f:
+        with open(img_file_path, 'rb') as f:
             img_data = f.read()
         b64 = base64.b64encode(img_data).decode('ascii')
     except Exception as e:
-        return {"content": [{"type": "text", "text": f"Error reading image {next_img['path']}: {e}"}]}
+        return {"content": [{"type": "text", "text": (
+            f"Error reading image: {e}\n"
+            f"Tried paths:\n"
+            f"  1. {next_img['path']}\n"
+            f"  2. {os.path.join(_workspace(), rel_path)}\n"
+            f"  3. {os.path.join(TMP_PIC_DIR, next_img['filename'])}\n"
+            f"Image ID: {next_img['id']}\n"
+            f"Relative path: {rel_path}\n"
+            f"请确认工作区路径正确且图片文件存在。"
+        )}]}
 
     total = len(pending)
     processed = sum(1 for p in pending if p["processed"])
     remaining = total - processed - 1
 
     text_info = (
-        f"[{processed + 1}/{total}] 图片ID: {next_img['id']}\n\n"
+        f"[{processed + 1}/{total}] 图片ID: {next_img['id']}\n"
+        f"图片文件: {rel_path}\n\n"
         f"{IMAGE_ANALYSIS_PROMPT}\n\n"
         f"分析完成后调用 submit_image_result(image_id=\"{next_img['id']}\", analysis=\"你的分析结果\")"
     )
@@ -1179,6 +1202,7 @@ def handle_get_pending_image(args):
     result = {
         "content": content_parts,
         "image_id": next_img["id"],
+        "image_path": rel_path,
         "total_images": total,
         "processed_count": processed,
         "remaining": remaining + 1,

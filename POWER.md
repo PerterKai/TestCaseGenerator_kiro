@@ -89,9 +89,11 @@ keywords:
 ### 步骤 3: 逐一处理图片（仅"文档+图片模式"，支持跨 session）
 循环执行：
 1. 调用 `get_pending_image` 获取下一张待处理图片
-2. 用视觉能力分析图片内容
-3. 调用 `submit_image_result(image_id, analysis)` 提交分析结果
-4. 重复直到所有图片处理完毕
+2. 工具返回 base64 图片数据（image content）和图片的工作区相对路径（`image_path` 字段，如 `.tmp/picture/xxx.png`）
+3. 如果能直接看到图片（MCP image content 被正确传递），直接用视觉能力分析
+4. 如果看不到图片（只收到文本），通过返回的 `image_path` 读取图片文件进行分析
+5. 调用 `submit_image_result(image_id, analysis)` 提交分析结果
+6. 重复直到所有图片处理完毕
 
 当系统触发新 session 时：
 - 所有图片处理进度已自动持久化到 `.tmp/cache/`
