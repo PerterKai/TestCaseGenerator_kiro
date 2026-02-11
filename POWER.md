@@ -14,7 +14,7 @@ keywords:
   - 用例生成
 ---
 
-# Test Case Generator Power
+# Test Case Generator Power v7.0
 
 从 `.docx` 需求文档和概要设计文档自动生成结构化测试用例，AI 自动审查优化，最终导出 XMind 和测试报告。
 
@@ -23,8 +23,10 @@ keywords:
 - docx 文档先转换为 Markdown 文件，存放在 `.tmp/doc_mk/` 目录
 - 文档中的图片提取到 `.tmp/picture/` 目录，每张图片有唯一标识
 - Markdown 文件中用 `{{IMG:唯一标识}}` 占位符标记图片原始位置
+- **v7.0 新增**: 图片位置追踪 - 记录每张图片所属章节和上下文类型
 - 图片逐一通过 agent 多模态视觉能力分析
-- 分析结果直接写回 Markdown 文件，替换对应占位符
+- 分析结果直接写回 Markdown 文件，替换对应占位符，并添加位置标记
+- **v7.0 新增**: 图片位置验证工具 - 确保分析结果写入正确位置
 - 所有工作流状态持久化到 `.tmp/cache/` 目录，支持跨 session 恢复
 - 不依赖 OCR，完全基于 agent 多模态视觉能力
 
@@ -89,9 +91,12 @@ keywords:
 ### 步骤 3: 逐一处理图片（仅"文档+图片模式"，支持跨 session）
 循环执行：
 1. 调用 `get_pending_image` 获取下一张待处理图片
+   - **v7.0**: 返回图片的位置上下文（所属章节、上下文类型）
 2. 用视觉能力分析图片内容
 3. 调用 `submit_image_result(image_id, analysis)` 提交分析结果
+   - **v7.0**: 分析结果会带有位置标记写入 markdown
 4. 重复直到所有图片处理完毕
+5. **v7.0 新增**: 调用 `verify_image_positions` 验证所有图片分析结果位置正确
 
 当系统触发新 session 时：
 - 所有图片处理进度已自动持久化到 `.tmp/cache/`
@@ -101,6 +106,7 @@ keywords:
 关键原则：
 - 每次只获取和处理一张图片
 - 提取具体数据，禁止笼统概括
+- **v7.0**: 处理完所有图片后务必调用 `verify_image_positions` 验证位置
 
 ### 步骤 4: 分段获取文档，按模块生成用例
 1. 调用 `get_doc_summary` 获取文档结构概览（标题树 + 字数统计）
