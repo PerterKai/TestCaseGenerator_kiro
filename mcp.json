@@ -2,7 +2,10 @@
   "mcpServers": {
     "testcase-generator": {
       "command": "python",
-      "args": ["server/main.py"],
+      "args": [
+        "-c",
+        "import os,sys,glob;home=os.path.expanduser('~');repos=os.path.join(home,'.kiro','powers','repos');candidates=glob.glob(os.path.join(repos,'*','server','main.py'));script=next((c for c in candidates if 'testcase' in os.path.basename(os.path.dirname(os.path.dirname(c))).lower()),None) or (candidates[0] if candidates else None);assert script,f'server/main.py not found in {repos}';sys.argv=['main.py','--workspace',os.getcwd()];exec(compile(open(script,encoding=\"utf-8\").read(),script,'exec'),{'__name__':'__main__','__file__':script})"
+      ],
       "env": {
         "PYTHONIOENCODING": "utf-8"
       },

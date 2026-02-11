@@ -20,8 +20,8 @@ Power 安装后会自动配置 MCP Server。
 pip install python-docx Pillow
 ```
 
-> `mcp.json` 中 `command` 为 `"python"`，请确保系统 PATH 中的 python 已安装上述依赖。
-> 也可以修改 `mcp.json` 中的 `command` 指向虚拟环境的 python 路径。
+> `mcp.json` 使用 `python -c` 启动器自动定位 Power 仓库中的服务端脚本，无需手动配置路径。
+> 请确保系统 PATH 中的 `python` 已安装上述依赖。
 
 ## 使用
 

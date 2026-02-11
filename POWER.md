@@ -115,6 +115,7 @@ keywords:
 
 ## 注意事项
 
+- MCP Server 通过 `python -c` 启动器自动定位，从 `~/.kiro/powers/repos/` 中查找 `server/main.py`
 - MCP Server 是长驻进程，修改 `main.py` 后需要在 Kiro 的 MCP Server 面板中重连服务器才能生效
 - 如果遇到缓存状态不一致，可以调用 `parse_documents(force=true)` 重新开始
 - `append_module` 支持同名模块替换，不会产生重复
