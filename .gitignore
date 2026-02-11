@@ -1,6 +1,22 @@
-/.history
+# Kiro local settings
 /.kiro
+
+# Local history
+/.history
+
+# Runtime temp files (generated during workflow)
 /.tmp
+
+# Python virtual environment
 /.venv
+/venv
+__pycache__/
+*.pyc
+*.pyo
+
+# User documents (each user puts their own .docx here)
 /doc
-/test_cases.xmind
+
+# Generated output files
+*.xmind
+*_testCaseReport.md

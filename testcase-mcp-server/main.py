@@ -69,10 +69,23 @@ def send_error(rid, code, message):
 # Constants & Paths
 # ============================================================
 
+# Resolve workspace root: Kiro sets cwd to workspace root when launching MCP.
+# Also support --workspace CLI arg for manual runs.
+def _resolve_initial_workspace():
+    """Determine workspace root directory at startup."""
+    # Check CLI args first
+    for i, arg in enumerate(sys.argv):
+        if arg == "--workspace" and i + 1 < len(sys.argv):
+            return os.path.abspath(sys.argv[i + 1])
+    # Default: cwd (Kiro sets this to workspace root)
+    return os.getcwd()
+
+_INITIAL_WORKSPACE = _resolve_initial_workspace()
+
 WORKSPACE_DIR = None
-TMP_DOC_DIR = os.path.join(os.getcwd(), ".tmp", "doc_mk")
-TMP_PIC_DIR = os.path.join(os.getcwd(), ".tmp", "picture")
-TMP_CACHE_DIR = os.path.join(os.getcwd(), ".tmp", "cache")
+TMP_DOC_DIR = os.path.join(_INITIAL_WORKSPACE, ".tmp", "doc_mk")
+TMP_PIC_DIR = os.path.join(_INITIAL_WORKSPACE, ".tmp", "picture")
+TMP_CACHE_DIR = os.path.join(_INITIAL_WORKSPACE, ".tmp", "cache")
 
 # No forced session switch — let the system decide naturally.
 # Cross-session resume is still fully supported via .tmp/cache/.
@@ -87,7 +100,7 @@ def _update_workspace(directory):
 
 
 def _workspace():
-    return WORKSPACE_DIR or os.getcwd()
+    return WORKSPACE_DIR or _INITIAL_WORKSPACE
 
 # ============================================================
 # Cache / Persistence Layer
@@ -820,11 +833,34 @@ TOOLS = [
     },
     {
         "name": "export_xmind",
-        "description": "Export test cases to XMind format.",
+        "description": "Export test cases to XMind format. File named as 需求名_testCase.xmind by default.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "output_path": {"type": "string", "description": "Output file path (default: test_cases.xmind)"}
+                "output_path": {"type": "string", "description": "Output file path (default: 需求名_testCase.xmind)"},
+                "requirement_name": {"type": "string", "description": "Requirement name for file naming (auto-detected from docs if not provided)"}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "review_module_structure",
+        "description": "Review test case module structure for balance, duplicates, empty modules, and quality issues. Call this after initial generation and before final review to optimize module organization.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "export_report",
+        "description": "Generate test case report as markdown file (需求名_testCaseReport.md). Includes module overview, coverage dimensions, and requirement questions.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "requirement_name": {"type": "string", "description": "Requirement name for file naming (auto-detected if not provided)"},
+                "output_dir": {"type": "string", "description": "Output directory (default: workspace root)"},
+                "questions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of requirement questions/confirmation points discovered during analysis"
+                }
             },
             "required": []
         }
@@ -857,7 +893,7 @@ def handle_setup_environment(args):
 
 
 def handle_parse_documents(args):
-    directory = args.get("directory", os.getcwd())
+    directory = args.get("directory", _workspace())
     pattern = args.get("file_patterns", "*.docx")
     force = args.get("force", False)
     _update_workspace(directory)
@@ -1137,7 +1173,7 @@ def handle_submit_image_result(args):
 
 def handle_get_workflow_state(args):
     """Return current workflow state for session resume."""
-    directory = args.get("directory", os.getcwd())
+    directory = args.get("directory", _workspace())
     _update_workspace(directory)
 
     # Try to restore from cache
@@ -1167,8 +1203,12 @@ def handle_get_workflow_state(args):
     if md_files:
         lines.append(f"    - {len(md_files)} 个 Markdown 文件")
 
-    # Image analysis phase
+    # Image analysis phase — auto-fix stale status
     img_status = phases.get("image_analysis", {}).get("status", "pending")
+    if img_status == "in_progress" and total_imgs > 0 and unprocessed_imgs == 0:
+        # All images processed but status not updated — fix it
+        img_status = "completed"
+        _save_phase_state("image_analysis", "completed")
     lines.append(f"  阶段2 图片分析: {img_status}")
     if total_imgs > 0:
         lines.append(f"    - {processed_imgs}/{total_imgs} 张已处理, {unprocessed_imgs} 张待处理")
@@ -1178,6 +1218,10 @@ def handle_get_workflow_state(args):
     lines.append(f"  阶段3 用例生成: {gen_status}")
     if modules:
         lines.append(f"    - {len(modules)} 个模块, {total_cases} 个用例")
+
+    # Export phase
+    export_status = phases.get("export", {}).get("status", "pending")
+    lines.append(f"  阶段4 导出: {export_status}")
 
     # Determine resume instruction
     lines.append("")
@@ -1192,8 +1236,10 @@ def handle_get_workflow_state(args):
         lines.append("▶ 继续操作: 调用 get_pending_image 检查图片处理状态")
     elif (img_completed or total_imgs == 0) and not has_testcases:
         lines.append("▶ 继续操作: 调用 get_doc_summary 获取文档结构，然后按模块生成测试用例")
-    elif has_testcases:
-        lines.append("▶ 继续操作: 调用 export_xmind 导出最终文件")
+    elif has_testcases and export_status != "completed":
+        lines.append("▶ 继续操作: 调用 get_testcases 查看已有用例，可继续生成或调用 review_module_structure 审查模块结构，最后调用 export_xmind 和 export_report 导出")
+    elif export_status == "completed":
+        lines.append("▶ 工作流已完成。如需重新生成，请调用 parse_documents(force=true) 重新开始。")
     elif parse_status == "completed":
         lines.append("▶ 继续操作: 调用 get_pending_image 开始处理图片")
     else:
@@ -1364,6 +1410,14 @@ def handle_save_testcases(args):
     append_module = args.get("append_module", None)
 
     if append_module:
+        # Validate structure
+        if not isinstance(append_module, dict):
+            return {"content": [{"type": "text", "text": "Error: append_module must be a JSON object, not an array or primitive."}]}
+        if "name" not in append_module:
+            return {"content": [{"type": "text", "text": "Error: append_module must have a 'name' field."}]}
+        if "sub_modules" not in append_module:
+            append_module["sub_modules"] = []
+
         # Incremental: append one module (replace if same name exists)
         if not testcase_store["modules"]:
             _restore_store_from_cache()
@@ -1389,7 +1443,19 @@ def handle_save_testcases(args):
         )}]}
 
     if modules is None:
-        return {"content": [{"type": "text", "text": "Missing parameter: modules or append_module"}]}
+        return {"content": [{"type": "text", "text": "Missing parameter: modules or append_module. 必须提供 modules（全量数组）或 append_module（单个模块对象）之一。"}]}
+
+    if not isinstance(modules, list):
+        return {"content": [{"type": "text", "text": "Error: modules must be a JSON array."}]}
+
+    # Validate each module has required fields
+    for i, m in enumerate(modules):
+        if not isinstance(m, dict):
+            return {"content": [{"type": "text", "text": f"Error: modules[{i}] must be a JSON object."}]}
+        if "name" not in m:
+            return {"content": [{"type": "text", "text": f"Error: modules[{i}] must have a 'name' field."}]}
+        if "sub_modules" not in m:
+            m["sub_modules"] = []
 
     testcase_store["modules"] = modules
     _sync_store_to_cache()
@@ -1411,18 +1477,299 @@ def handle_get_testcases(args):
     }
 
 
+def _get_requirement_name():
+    """Extract requirement name from parsed documents for file naming."""
+    md_files = testcase_store.get("md_files", [])
+    if not md_files:
+        _restore_store_from_cache()
+        md_files = testcase_store.get("md_files", [])
+    # Use the first requirement doc name (strip common prefixes)
+    for md_info in md_files:
+        name = md_info.get("name", "")
+        name = os.path.splitext(name)[0]
+        # Prefer requirement docs over design docs
+        if "需求" in name or "requirement" in name.lower():
+            # Clean up common prefixes like [需求]
+            name = re.sub(r'^\[.*?\]', '', name).strip()
+            if name:
+                return name
+    # Fallback: use first doc name
+    if md_files:
+        name = os.path.splitext(md_files[0].get("name", "test_cases"))[0]
+        name = re.sub(r'^\[.*?\]', '', name).strip()
+        return name or "test_cases"
+    return "test_cases"
+
+
+def handle_review_module_structure(args):
+    """Review and suggest optimizations for test case module structure."""
+    if not testcase_store["modules"]:
+        _restore_store_from_cache()
+    modules = testcase_store["modules"]
+    if not modules:
+        return {"content": [{"type": "text", "text": "没有测试用例可供审查。请先生成用例。"}]}
+
+    issues = []
+    suggestions = []
+    stats = []
+
+    # 1. Check for empty modules/sub_modules
+    for m in modules:
+        subs = m.get("sub_modules", [])
+        if not subs:
+            issues.append(f"⚠️ 模块 '{m['name']}' 没有子模块")
+        for s in subs:
+            cases = s.get("test_cases", [])
+            if not cases:
+                issues.append(f"⚠️ 子模块 '{m['name']} > {s['name']}' 没有用例")
+
+    # 2. Check module size balance
+    module_sizes = []
+    for m in modules:
+        total = sum(len(s.get("test_cases", [])) for s in m.get("sub_modules", []))
+        module_sizes.append((m["name"], total))
+        stats.append(f"  📦 {m['name']}: {len(m.get('sub_modules', []))} 子模块, {total} 用例")
+
+    if module_sizes:
+        sizes = [s for _, s in module_sizes]
+        max_name, max_size = max(module_sizes, key=lambda x: x[1])
+        min_name, min_size = min(module_sizes, key=lambda x: x[1])
+
+        if max_size > 0 and min_size > 0 and max_size / max(min_size, 1) > 5:
+            suggestions.append(
+                f"💡 模块大小不均衡: '{max_name}'({max_size}个用例) vs '{min_name}'({min_size}个用例)，"
+                f"建议拆分大模块或合并小模块"
+            )
+
+        # Check for overly large sub_modules (>15 cases)
+        for m in modules:
+            for s in m.get("sub_modules", []):
+                case_count = len(s.get("test_cases", []))
+                if case_count > 15:
+                    suggestions.append(
+                        f"💡 子模块 '{m['name']} > {s['name']}' 有 {case_count} 个用例，"
+                        f"建议按场景拆分为更细粒度的子模块"
+                    )
+
+    # 3. Check for duplicate or very similar module/sub_module names
+    mod_names = [m["name"] for m in modules]
+    seen_names = {}
+    for name in mod_names:
+        key = name.strip().lower()
+        if key in seen_names:
+            issues.append(f"⚠️ 存在重复模块名: '{name}' 和 '{seen_names[key]}'")
+        seen_names[key] = name
+
+    for m in modules:
+        sub_names = [s["name"] for s in m.get("sub_modules", [])]
+        seen_sub = {}
+        for name in sub_names:
+            key = name.strip().lower()
+            if key in seen_sub:
+                issues.append(f"⚠️ 模块 '{m['name']}' 下存在重复子模块名: '{name}'")
+            seen_sub[key] = name
+
+    # 4. Check for sub_modules with only 1 case (might be too granular)
+    for m in modules:
+        single_case_subs = [s["name"] for s in m.get("sub_modules", [])
+                           if len(s.get("test_cases", [])) == 1]
+        if len(single_case_subs) >= 3:
+            suggestions.append(
+                f"💡 模块 '{m['name']}' 下有 {len(single_case_subs)} 个只含1个用例的子模块，"
+                f"考虑合并相关子模块: {', '.join(single_case_subs[:5])}"
+            )
+
+    # 5. Check test case quality
+    missing_preconditions = 0
+    missing_expected = 0
+    empty_steps = 0
+    for m in modules:
+        for s in m.get("sub_modules", []):
+            for c in s.get("test_cases", []):
+                if not c.get("preconditions", "").strip():
+                    missing_preconditions += 1
+                if not c.get("expected_result", "").strip():
+                    missing_expected += 1
+                if not c.get("steps") or all(not step.strip() for step in c.get("steps", [])):
+                    empty_steps += 1
+
+    if missing_preconditions > 0:
+        issues.append(f"⚠️ {missing_preconditions} 个用例缺少前置条件")
+    if missing_expected > 0:
+        issues.append(f"⚠️ {missing_expected} 个用例缺少预期结果")
+    if empty_steps > 0:
+        issues.append(f"⚠️ {empty_steps} 个用例缺少执行步骤")
+
+    # Build report
+    total_cases = sum(s[1] for s in module_sizes)
+    lines = [
+        f"📊 模块结构审查报告",
+        f"",
+        f"总计: {len(modules)} 个模块, {total_cases} 个用例",
+        f"",
+        f"模块统计:",
+    ]
+    lines.extend(stats)
+
+    if issues:
+        lines.append(f"\n发现 {len(issues)} 个问题:")
+        lines.extend(issues)
+
+    if suggestions:
+        lines.append(f"\n优化建议:")
+        lines.extend(suggestions)
+
+    if not issues and not suggestions:
+        lines.append("\n✅ 模块结构合理，未发现明显问题。")
+
+    lines.append(f"\n如需调整模块结构，请修改后调用 save_testcases(modules=修改后的全部用例数组) 保存。")
+
+    return {
+        "content": [{"type": "text", "text": "\n".join(lines)}],
+        "module_count": len(modules),
+        "total_cases": total_cases,
+        "issue_count": len(issues),
+        "suggestion_count": len(suggestions),
+    }
+
+
+def handle_export_report(args):
+    """Generate test case report as markdown file."""
+    if not testcase_store["modules"]:
+        _restore_store_from_cache()
+    modules = testcase_store["modules"]
+    if not modules:
+        return {"content": [{"type": "text", "text": "没有测试用例可供生成报告。"}]}
+
+    req_name = args.get("requirement_name") or _get_requirement_name()
+    output_dir = args.get("output_dir", _workspace())
+    # questions/confirmations from the agent about the requirements
+    questions = args.get("questions", [])
+
+    total_cases = sum(len(s.get("test_cases", []))
+                      for m in modules for s in m.get("sub_modules", []))
+    total_subs = sum(len(m.get("sub_modules", [])) for m in modules)
+
+    lines = [
+        f"# 测试用例生成报告",
+        f"",
+        f"## 基本信息",
+        f"",
+        f"| 项目 | 内容 |",
+        f"|------|------|",
+        f"| 需求名称 | {req_name} |",
+        f"| 模块数量 | {len(modules)} |",
+        f"| 子模块数量 | {total_subs} |",
+        f"| 用例总数 | {total_cases} |",
+        f"| XMind文件 | {req_name}_testCase.xmind |",
+        f"",
+        f"## 用例覆盖概览",
+        f"",
+    ]
+
+    # Per-module breakdown
+    for m in modules:
+        subs = m.get("sub_modules", [])
+        mod_total = sum(len(s.get("test_cases", [])) for s in subs)
+        lines.append(f"### {m['name']} ({mod_total} 个用例)")
+        lines.append(f"")
+        lines.append(f"| 子模块 | 用例数 | 覆盖维度 |")
+        lines.append(f"|--------|--------|----------|")
+        for s in subs:
+            cases = s.get("test_cases", [])
+            # Analyze coverage dimensions
+            dimensions = set()
+            for c in cases:
+                title = c.get("title", "").lower()
+                steps_text = " ".join(c.get("steps", [])).lower()
+                combined = title + " " + steps_text
+                if any(kw in combined for kw in ["正常", "正向", "成功", "默认"]):
+                    dimensions.add("正向")
+                if any(kw in combined for kw in ["边界", "最大", "最小", "上限", "下限", "空"]):
+                    dimensions.add("边界")
+                if any(kw in combined for kw in ["异常", "失败", "错误", "不存在", "无效", "非法", "超", "缺少"]):
+                    dimensions.add("异常")
+                if any(kw in combined for kw in ["安全", "认证", "授权", "权限", "注入", "xss"]):
+                    dimensions.add("安全")
+                if any(kw in combined for kw in ["并发", "性能", "大数据", "批量"]):
+                    dimensions.add("性能")
+            dim_str = ", ".join(sorted(dimensions)) if dimensions else "正向"
+            lines.append(f"| {s['name']} | {len(cases)} | {dim_str} |")
+        lines.append(f"")
+
+    # Coverage dimension summary
+    all_dims = {"正向": 0, "边界": 0, "异常": 0, "安全": 0, "性能": 0}
+    for m in modules:
+        for s in m.get("sub_modules", []):
+            for c in s.get("test_cases", []):
+                title = c.get("title", "").lower()
+                steps_text = " ".join(c.get("steps", [])).lower()
+                combined = title + " " + steps_text
+                if any(kw in combined for kw in ["正常", "正向", "成功", "默认"]):
+                    all_dims["正向"] += 1
+                if any(kw in combined for kw in ["边界", "最大", "最小", "上限", "下限", "空"]):
+                    all_dims["边界"] += 1
+                if any(kw in combined for kw in ["异常", "失败", "错误", "不存在", "无效", "非法", "超", "缺少"]):
+                    all_dims["异常"] += 1
+                if any(kw in combined for kw in ["安全", "认证", "授权", "权限", "注入", "xss"]):
+                    all_dims["安全"] += 1
+                if any(kw in combined for kw in ["并发", "性能", "大数据", "批量"]):
+                    all_dims["性能"] += 1
+
+    lines.append(f"## 覆盖维度统计")
+    lines.append(f"")
+    lines.append(f"| 维度 | 用例数 | 占比 |")
+    lines.append(f"|------|--------|------|")
+    for dim, count in sorted(all_dims.items(), key=lambda x: -x[1]):
+        pct = f"{count / total_cases * 100:.1f}%" if total_cases > 0 else "0%"
+        lines.append(f"| {dim} | {count} | {pct} |")
+    lines.append(f"")
+
+    # Questions / confirmation points
+    if questions:
+        lines.append(f"## 需求疑问点与确认项")
+        lines.append(f"")
+        for i, q in enumerate(questions, 1):
+            lines.append(f"{i}. {q}")
+        lines.append(f"")
+
+    lines.append(f"---")
+    lines.append(f"*报告由 TestCase Generator 自动生成*")
+
+    report_content = "\n".join(lines)
+    report_filename = f"{req_name}_testCaseReport.md"
+    report_path = os.path.join(output_dir, report_filename)
+
+    try:
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(report_content)
+        return {
+            "content": [{"type": "text", "text": f"✓ 报告已生成: {report_path}\n\n{report_content}"}],
+            "report_path": report_path,
+            "report_filename": report_filename,
+        }
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"报告生成失败: {e}\n\n报告内容:\n{report_content}"}]}
+
+
 def handle_export_xmind(args):
     if not testcase_store["modules"]:
         _restore_store_from_cache()
     if not testcase_store["modules"]:
         return {"content": [{"type": "text", "text": "No test cases to export."}]}
-    p = args.get("output_path", os.path.join(_workspace(), "test_cases.xmind"))
+
+    # Support custom naming: 需求名_testCase.xmind
+    req_name = args.get("requirement_name") or _get_requirement_name()
+    default_filename = f"{req_name}_testCase.xmind"
+    p = args.get("output_path", os.path.join(_workspace(), default_filename))
+
     try:
         create_xmind_file(testcase_store["modules"], p)
         total = sum(len(s.get("test_cases", [])) for m in testcase_store["modules"]
                     for s in m.get("sub_modules", []))
         _save_phase_state("export", "completed")
-        return {"content": [{"type": "text", "text": f"Exported: {p}\n{len(testcase_store['modules'])} modules, {total} cases"}]}
+        return {"content": [{"type": "text", "text": f"Exported: {p}\n{len(testcase_store['modules'])} modules, {total} cases"}],
+                "xmind_path": p, "requirement_name": req_name}
     except Exception as e:
         return {"content": [{"type": "text", "text": f"Export failed: {e}"}]}
 
@@ -1442,6 +1789,8 @@ HANDLERS = {
     "save_testcases": handle_save_testcases,
     "get_testcases": handle_get_testcases,
     "export_xmind": handle_export_xmind,
+    "review_module_structure": handle_review_module_structure,
+    "export_report": handle_export_report,
 }
 
 
@@ -1471,7 +1820,11 @@ def handle_request(req):
                 result = handler(params.get("arguments", {}))
                 send_response(rid, result)
             except Exception as e:
-                send_response(rid, {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True})
+                import traceback
+                tb = traceback.format_exc()
+                sys.stderr.write(f"[MCP] Tool error in {name}: {tb}\n")
+                sys.stderr.flush()
+                send_response(rid, {"content": [{"type": "text", "text": f"Error in {name}: {e}"}], "isError": True})
         else:
             send_error(rid, -32601, f"Unknown tool: {name}")
     elif method == "ping":

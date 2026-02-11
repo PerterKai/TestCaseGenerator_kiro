@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "testcase-generator": {
-      "command": "C:\\Users\\xpeng\\Desktop\\Project\\TestCaseGenerator\\.venv\\Scripts\\python.exe",
-      "args": ["C:\\Users\\xpeng\\Desktop\\Project\\TestCaseGenerator\\testcase-mcp-server\\main.py"],
+      "command": "python",
+      "args": ["testcase-mcp-server/main.py"],
       "env": {
         "PYTHONIOENCODING": "utf-8"
       },
@@ -18,7 +18,9 @@
         "get_parsed_markdown",
         "save_testcases",
         "get_testcases",
-        "export_xmind"
+        "export_xmind",
+        "review_module_structure",
+        "export_report"
       ]
     }
   }

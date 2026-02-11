@@ -16,7 +16,7 @@ keywords:
 
 # Test Case Generator Power
 
-从 `.docx` 需求文档和概要设计文档自动生成结构化测试用例，AI 自动审查优化，最终导出 XMind。
+从 `.docx` 需求文档和概要设计文档自动生成结构化测试用例，AI 自动审查优化，最终导出 XMind 和测试报告。
 
 ## 架构说明
 
@@ -76,14 +76,28 @@ keywords:
 
 重要：避免使用 `get_parsed_markdown` 一次性加载全部文档，优先使用分段读取。
 
+### 步骤 4.5: 模块结构审查
+用例初步生成完毕后，调用 `review_module_structure` 审查模块划分是否合理：
+- 检查模块大小是否均衡（避免某模块过大或过小）
+- 检查是否有空模块/子模块
+- 检查是否有重复命名
+- 检查子模块粒度是否合适
+- 检查用例质量（前置条件、步骤、预期结果是否完整）
+
+根据审查结果调整模块结构，调整后调用 `save_testcases(modules=调整后的全部用例数组)` 保存。
+
 ### 步骤 5: 自动 Review 与迭代
 1. 调用 `get_testcases` 获取当前所有用例
 2. 审查功能覆盖、边界条件、异常场景、步骤可执行性
 3. 修改后调用 `save_testcases(modules=修改后的全部用例数组)` 保存（Review 阶段用 `modules` 全量替换）
 4. 重复 1-3，迭代 2-3 轮
+5. 在 Review 过程中，记录发现的需求疑问点和确认项
 
-### 步骤 6: 导出 XMind
-调用 `export_xmind` 导出 `.xmind` 文件。
+### 步骤 6: 导出 XMind + 报告
+1. 调用 `export_xmind` 导出 `.xmind` 文件（自动命名为 `需求名_testCase.xmind`）
+2. 调用 `export_report(questions=[...])` 导出测试报告（自动命名为 `需求名_testCaseReport.md`）
+   - 传入 `questions` 参数，包含 Review 过程中发现的需求疑问点
+   - 报告包含：模块概览、覆盖维度统计、需求疑问点
 
 ## 跨 session 恢复机制
 
@@ -104,3 +118,4 @@ keywords:
 - MCP Server 是长驻进程，修改 `main.py` 后需要在 Kiro 的 MCP Server 面板中重连服务器才能生效
 - 如果遇到缓存状态不一致，可以调用 `parse_documents(force=true)` 重新开始
 - `append_module` 支持同名模块替换，不会产生重复
+- `save_testcases` 的 `append_module` 参数必须是单个模块对象（非数组），`modules` 参数必须是数组
