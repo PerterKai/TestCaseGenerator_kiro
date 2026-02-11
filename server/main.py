@@ -168,11 +168,15 @@ def _img_mime(ext):
 
 
 def _generate_image_id(doc_name, img_name):
+    """Generate a stable, extension-free image ID.
+    
+    The ID has no file extension so it stays consistent regardless of
+    format conversion during resize (e.g. .png -> .jpg).
+    """
     raw = f"{doc_name}_{img_name}"
     short_hash = hashlib.md5(raw.encode()).hexdigest()[:8]
     base = os.path.splitext(img_name)[0]
-    ext = os.path.splitext(img_name)[1]
-    return f"{base}_{short_hash}{ext}"
+    return f"{base}_{short_hash}"
 
 
 def _resize_image(img_data, ext):
@@ -237,8 +241,10 @@ def _find_images_in_element(elem, rid_to_media):
     A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
     R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
     W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    V_NS = 'urn:schemas-microsoft-com:vml'
     found = []
     seen = set()
+    # 1. DrawingML images (a:blip)
     for blip in elem.iter(f'{{{A_NS}}}blip'):
         rid = blip.get(f'{{{R_NS}}}embed', '')
         if rid and rid in rid_to_media:
@@ -246,8 +252,18 @@ def _find_images_in_element(elem, rid_to_media):
             if name not in seen:
                 seen.add(name)
                 found.append(name)
+    # 2. VML images inside w:pict
     for pict in elem.iter(f'{{{W_NS}}}pict'):
         for child in pict.iter():
+            rid = child.get(f'{{{R_NS}}}id', '')
+            if rid and rid in rid_to_media:
+                name = rid_to_media[rid]
+                if name not in seen:
+                    seen.add(name)
+                    found.append(name)
+    # 3. VML images inside w:object (e.g. pasted from Excel/Visio)
+    for obj in elem.iter(f'{{{W_NS}}}object'):
+        for child in obj.iter(f'{{{V_NS}}}imagedata'):
             rid = child.get(f'{{{R_NS}}}id', '')
             if rid and rid in rid_to_media:
                 name = rid_to_media[rid]
@@ -294,7 +310,7 @@ def _detect_heading_level(para):
         return 3
     return 0
 
-def _table_to_markdown(table, rid_to_media, doc_name, image_registry):
+def _table_to_markdown(table, rid_to_media, doc_name, image_registry, image_id_counter):
     rows = []
     for row in table.rows:
         row_data = []
@@ -308,7 +324,11 @@ def _table_to_markdown(table, rid_to_media, doc_name, image_registry):
                 for img_name in cell_images:
                     img_id = _generate_image_id(doc_name, img_name)
                     image_registry[img_name] = img_id
-                    cell_text += f" {{{{IMG:{img_id}}}}}"
+                    # Make placeholder unique for duplicate references
+                    image_id_counter[img_id] = image_id_counter.get(img_id, 0) + 1
+                    count = image_id_counter[img_id]
+                    placeholder_id = img_id if count == 1 else f"{img_id}__dup{count}"
+                    cell_text += f" {{{{IMG:{placeholder_id}}}}}"
             row_data.append(cell_text)
         rows.append(row_data)
     if not rows:
@@ -367,6 +387,7 @@ def convert_docx_to_markdown(filepath):
     rid_to_media = _build_rid_to_media(filepath)
     image_registry = {}
     image_data_map = {}
+    image_id_counter = {}  # Track occurrences of each base image_id for unique placeholders
     md_lines = [f"# {doc_name}", ""]
 
     try:
@@ -404,7 +425,11 @@ def convert_docx_to_markdown(filepath):
                 for img_name in para_images:
                     img_id = _generate_image_id(doc_name, img_name)
                     image_registry[img_name] = img_id
-                    md_lines.append(f"{{{{IMG:{img_id}}}}}")
+                    # Make placeholder unique for duplicate references
+                    image_id_counter[img_id] = image_id_counter.get(img_id, 0) + 1
+                    count = image_id_counter[img_id]
+                    placeholder_id = img_id if count == 1 else f"{img_id}__dup{count}"
+                    md_lines.append(f"{{{{IMG:{placeholder_id}}}}}")
                     md_lines.append("")
         elif tag == 'tbl':
             # Find the corresponding table object
@@ -415,7 +440,7 @@ def convert_docx_to_markdown(filepath):
                     break
             if tbl is not None:
                 md_lines.append("")
-                table_md = _table_to_markdown(tbl, rid_to_media, doc_name, image_registry)
+                table_md = _table_to_markdown(tbl, rid_to_media, doc_name, image_registry, image_id_counter)
                 if table_md:
                     md_lines.append(table_md)
                     md_lines.append("")
@@ -448,9 +473,12 @@ def convert_docx_to_markdown(filepath):
             if skipped_ids:
                 md_text = "\n".join(md_lines)
                 for sid in skipped_ids:
+                    # Replace base placeholder and any __dup variants
                     placeholder = f"{{{{IMG:{sid}}}}}"
                     annotation = f"<!-- 已跳过小图标: {sid} -->"
                     md_text = md_text.replace(placeholder, annotation)
+                    dup_pat = re.escape(f"{{{{IMG:{sid}__dup") + r"\d+" + re.escape("}}")
+                    md_text = re.sub(dup_pat, annotation, md_text)
                 md_lines = md_text.split("\n")
     except Exception:
         pass
@@ -462,6 +490,7 @@ def _convert_docx_raw(filepath):
     rid_to_media = _build_rid_to_media(filepath)
     image_registry = {}
     image_data_map = {}
+    image_id_counter = {}
     md_lines = [f"# {doc_name}", ""]
 
     try:
@@ -498,7 +527,10 @@ def _convert_docx_raw(filepath):
                         for img_name in para_images:
                             img_id = _generate_image_id(doc_name, img_name)
                             image_registry[img_name] = img_id
-                            md_lines.append(f"{{{{IMG:{img_id}}}}}")
+                            image_id_counter[img_id] = image_id_counter.get(img_id, 0) + 1
+                            count = image_id_counter[img_id]
+                            placeholder_id = img_id if count == 1 else f"{img_id}__dup{count}"
+                            md_lines.append(f"{{{{IMG:{placeholder_id}}}}}")
                             md_lines.append("")
                     elif tag == 'tbl':
                         rows = []
@@ -510,7 +542,10 @@ def _convert_docx_raw(filepath):
                                 for img_name in cell_images:
                                     img_id = _generate_image_id(doc_name, img_name)
                                     image_registry[img_name] = img_id
-                                    cell_text += f" {{{{IMG:{img_id}}}}}"
+                                    image_id_counter[img_id] = image_id_counter.get(img_id, 0) + 1
+                                    count = image_id_counter[img_id]
+                                    placeholder_id = img_id if count == 1 else f"{img_id}__dup{count}"
+                                    cell_text += f" {{{{IMG:{placeholder_id}}}}}"
                                 row.append(cell_text.replace('|', '\\|'))
                             if row:
                                 rows.append(row)
@@ -551,6 +586,8 @@ def _convert_docx_raw(filepath):
                     placeholder = f"{{{{IMG:{sid}}}}}"
                     annotation = f"<!-- 已跳过小图标: {sid} -->"
                     md_text = md_text.replace(placeholder, annotation)
+                    dup_pat = re.escape(f"{{{{IMG:{sid}__dup") + r"\d+" + re.escape("}}")
+                    md_text = re.sub(dup_pat, annotation, md_text)
                 md_lines = md_text.split("\n")
     except Exception as e:
         md_lines.append(f"\n> 解析错误: {e}\n")
@@ -1070,7 +1107,7 @@ def handle_parse_documents(args):
             for img_id, (img_data, ext) in image_data_map.items():
                 resized_data, mime = _resize_image(img_data, ext)
                 out_ext = ".png" if "png" in mime else ".jpg"
-                img_filename = os.path.splitext(img_id)[0] + out_ext
+                img_filename = img_id + out_ext
                 img_path = os.path.join(TMP_PIC_DIR, img_filename)
                 with open(img_path, 'wb') as f:
                     f.write(resized_data)
@@ -1228,24 +1265,27 @@ def handle_submit_image_result(args):
             md_content = f.read()
 
         placeholder = f"{{{{IMG:{image_id}}}}}"
-        replacement = f"<!-- 图片分析: {target['filename']} -->\n{analysis}\n<!-- /图片分析 -->"
+        replacement = f"<!-- 图片分析: {image_id} -->\n{analysis}\n<!-- /图片分析 -->"
 
         if placeholder in md_content:
-            md_content = md_content.replace(placeholder, replacement)
+            # Only replace the FIRST occurrence to avoid overwriting duplicate placeholders
+            md_content = md_content.replace(placeholder, replacement, 1)
             with open(md_path, 'w', encoding='utf-8') as f:
                 f.write(md_content)
             target["processed"] = True
         else:
-            base_id = os.path.splitext(image_id)[0]
+            # Try matching __dup variants (same image referenced multiple times)
             found = False
-            for pattern_try in [f"{{{{IMG:{base_id}.png}}}}", f"{{{{IMG:{base_id}.jpg}}}}", f"{{{{IMG:{base_id}.jpeg}}}}"]:
-                if pattern_try in md_content:
-                    md_content = md_content.replace(pattern_try, replacement)
-                    with open(md_path, 'w', encoding='utf-8') as f:
-                        f.write(md_content)
-                    target["processed"] = True
-                    found = True
-                    break
+            import re as _re
+            dup_match = _re.search(_re.escape(f"{{{{IMG:{image_id}__dup") + r"\d+" + _re.escape("}}"), md_content)
+            if dup_match:
+                # Replace the first dup placeholder found
+                dup_replacement = f"<!-- 图片分析: {image_id} (重复引用) -->\n{analysis}\n<!-- /图片分析 -->"
+                md_content = md_content[:dup_match.start()] + dup_replacement + md_content[dup_match.end():]
+                with open(md_path, 'w', encoding='utf-8') as f:
+                    f.write(md_content)
+                target["processed"] = True
+                found = True
             if not found:
                 target["processed"] = True
                 return {"content": [{"type": "text", "text": f"Warning: placeholder {{{{IMG:{image_id}}}}} not found in {md_path}. Marked as processed."}]}
