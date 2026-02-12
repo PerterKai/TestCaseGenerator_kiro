@@ -69,9 +69,11 @@ def _http_request(url, method="GET", data=None, headers=None, timeout=15):
 
     # Allow both http and https; disable cert verification for local/self-signed APIs
     # (common for local LLM servers like LM Studio, Ollama, etc.)
+    # NOTE: This is intentional for local development use. Production APIs should
+    # use proper certificates. The tool targets local multimodal LLM servers.
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx.verify_mode = ssl.CERT_NONE  # noqa: S501 — intentional for local LLM servers
 
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:

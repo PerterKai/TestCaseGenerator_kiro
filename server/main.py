@@ -194,101 +194,6 @@ def _should_process_image(w, h):
     return short > IMG_MIN_SHORT_EDGE and long_ >= IMG_MIN_LONG_EDGE
 
 
-def _is_low_info_image(img_data):
-    """Detect background/decorative images with very low information content.
-    
-    Filters out images that are nearly uniform in color (e.g. white/grey
-    background layers, watermark patterns, solid fills) by checking:
-    1. Grayscale standard deviation — low means nearly uniform color
-    2. Unique color ratio — low means very few distinct colors relative to pixels
-    """
-    try:
-        from PIL import Image
-        img = Image.open(BytesIO(img_data))
-        # Sample at reduced size for speed (64x64 is enough for statistics)
-        thumb = img.resize((64, 64), Image.LANCZOS).convert('L')
-        pixels = list(thumb.getdata())
-        n = len(pixels)
-        if n == 0:
-            return True
-        # Standard deviation of grayscale values
-        mean = sum(pixels) / n
-        variance = sum((p - mean) ** 2 for p in pixels) / n
-        std_dev = variance ** 0.5
-        # Unique color ratio (on thumbnail)
-        unique_ratio = len(set(pixels)) / 256.0  # out of 256 possible gray levels
-        # Very low std_dev means nearly uniform (background/solid fill)
-        # Threshold: std_dev < 20 AND fewer than 15% of gray levels used
-        if std_dev < 20 and unique_ratio < 0.15:
-            return True
-        # Also catch images where >95% of pixels are very light (>220)
-        # BUT exclude diagrams/flowcharts that have white backgrounds with
-        # meaningful structure (edges, lines, text boxes).
-        light_count = sum(1 for p in pixels if p > 220)
-        if light_count / n > 0.95:
-            # Before discarding, check for meaningful edge content.
-            # Diagrams on white backgrounds have sparse but clear edges.
-            from PIL import ImageFilter
-            edges = thumb.filter(ImageFilter.FIND_EDGES)
-            edge_pixels = list(edges.getdata())
-            # Count pixels with significant edge response (>30)
-            edge_active = sum(1 for p in edge_pixels if p > 30)
-            edge_ratio = edge_active / n
-            # If more than 3% of pixels have strong edges, it's a diagram,
-            # not a blank/decorative background — keep it.
-            if edge_ratio > 0.03:
-                return False
-            return True
-        return False
-    except Exception:
-        return False
-
-
-def _is_blurry_overview(img_data):
-    """Detect blurry overview/thumbnail images where text is unreadable.
-    
-    Uses Laplacian variance to measure edge sharpness. Overview screenshots
-    that show many tiny windows/panels shrunk to unreadable size will have
-    very low Laplacian variance because all detail is lost to scaling.
-    
-    Also checks the ratio of "dark background" pixels — overview images
-    from design tools often have large dark/black canvas areas.
-    """
-    try:
-        from PIL import Image, ImageFilter
-        img = Image.open(BytesIO(img_data))
-        w, h = img.size
-        # Only check images large enough to be overview screenshots
-        if w < 400 or h < 300:
-            return False
-        # Resize to standard analysis size (512px wide) for consistent thresholds
-        ratio = 512.0 / w
-        analyze_img = img.resize((512, int(h * ratio)), Image.LANCZOS).convert('L')
-        _aw, _ah = analyze_img.size
-        pixels = list(analyze_img.getdata())
-        n = len(pixels)
-        # Check 1: Large dark background ratio (>40% pixels very dark, <40)
-        # Overview images from design tools have big black/dark canvas
-        dark_count = sum(1 for p in pixels if p < 40)
-        dark_ratio = dark_count / n
-        # Check 2: Laplacian variance (edge sharpness)
-        # Apply Laplacian kernel via Pillow's FIND_EDGES
-        edges = analyze_img.filter(ImageFilter.FIND_EDGES)
-        edge_pixels = list(edges.getdata())
-        edge_mean = sum(edge_pixels) / len(edge_pixels)
-        edge_var = sum((p - edge_mean) ** 2 for p in edge_pixels) / len(edge_pixels)
-        # Overview/thumbnail images: lots of dark background + low edge detail
-        # Threshold: >40% dark background AND low edge variance (<800)
-        if dark_ratio > 0.40 and edge_var < 800:
-            return True
-        # Also catch extremely blurry images regardless of background
-        # (edge variance < 200 means almost no discernible detail)
-        if edge_var < 200:
-            return True
-        return False
-    except Exception:
-        return False
-
 # ============================================================
 # Image helpers
 # ============================================================
@@ -332,13 +237,9 @@ def _resize_image(img_data, ext):
             img_obj = img_obj.convert('L')
 
         buf = BytesIO()
-        if img_obj.mode in ('RGBA', 'P', 'LA'):
-            img_obj.save(buf, format='PNG', optimize=True)
-            final_mime = "image/png"
-        else:
-            # quality=65 is the sweet spot: text stays sharp, ~30% smaller than q80
-            img_obj.save(buf, format='JPEG', quality=65)
-            final_mime = "image/jpeg"
+        # quality=65 is the sweet spot: text stays sharp, ~30% smaller than q80
+        img_obj.save(buf, format='JPEG', quality=65)
+        final_mime = "image/jpeg"
         final_data = buf.getvalue()
     except Exception:
         pass
@@ -350,6 +251,7 @@ def _resize_image(img_data, ext):
 
 def _build_rid_to_media(filepath):
     rid_to_media = {}
+    header_footer_media = set()  # images only referenced by headers/footers (e.g. watermarks)
     try:
         with zipfile.ZipFile(filepath, 'r') as z:
             # Collect all actual media files in the zip for cross-reference
@@ -358,31 +260,51 @@ def _build_rid_to_media(filepath):
                 if name.startswith('word/media/'):
                     actual_media.add(os.path.basename(name))
 
+            # Track which media are referenced by document.xml vs headers/footers
+            doc_rels_media = set()
+            hf_rels_media = set()
+
             # Parse all .rels files under word/ (document, headers, footers, etc.)
             rels_files = [n for n in z.namelist()
                           if n.startswith('word/') and n.endswith('.rels')]
             for rels_path in rels_files:
+                # Determine if this rels file belongs to a header/footer
+                rels_basename = os.path.basename(rels_path).replace('.rels', '')
+                is_hf = any(k in rels_basename for k in ('header', 'footer'))
                 try:
                     rels_root = ET.fromstring(z.read(rels_path))
                     for rel in rels_root:
                         target = rel.get('Target', '')
                         rid = rel.get('Id', '')
                         rel_type = rel.get('Type', '')
+                        media_name = None
                         # Match media/ in target path (handles media/xxx and ../media/xxx)
                         if 'media/' in target:
-                            rid_to_media[rid] = target.split('/')[-1]
+                            media_name = target.split('/')[-1]
+                            rid_to_media[rid] = media_name
                         # Also match image relationship types without media/ in path
                         elif 'image' in rel_type.lower():
                             basename = target.split('/')[-1]
                             if basename in actual_media:
-                                rid_to_media[rid] = basename
+                                media_name = basename
+                                rid_to_media[rid] = media_name
                         # OLE object images
                         elif 'oleObject' in rel_type or 'package' in rel_type.lower():
                             basename = target.split('/')[-1]
                             if basename in actual_media:
-                                rid_to_media[rid] = basename
+                                media_name = basename
+                                rid_to_media[rid] = media_name
+
+                        if media_name:
+                            if is_hf:
+                                hf_rels_media.add(media_name)
+                            else:
+                                doc_rels_media.add(media_name)
                 except Exception:
                     continue
+
+            # Images referenced ONLY by headers/footers (not by document body) are watermarks
+            header_footer_media = hf_rels_media - doc_rels_media
 
             # Ensure all media files are discoverable: create reverse mapping
             # for any media file not yet referenced by a relationship
@@ -393,7 +315,7 @@ def _build_rid_to_media(filepath):
                 sys.stderr.flush()
     except Exception:
         pass
-    return rid_to_media
+    return rid_to_media, header_footer_media
 
 
 def _build_ole_excel_map(filepath):
@@ -674,7 +596,7 @@ def _table_to_markdown(table, rid_to_media, doc_name, image_registry):
 
 def convert_docx_to_markdown(filepath):
     doc_name = os.path.splitext(os.path.basename(filepath))[0]
-    rid_to_media = _build_rid_to_media(filepath)
+    rid_to_media, header_footer_media = _build_rid_to_media(filepath)
     ole_excel_map = _build_ole_excel_map(filepath)  # preview_image_name -> xlsx_zip_path
     ole_preview_names = set(ole_excel_map.keys())  # image names to skip (replaced by table)
     image_registry = {}
@@ -770,6 +692,9 @@ def convert_docx_to_markdown(filepath):
                 # Skip OLE Excel preview images (already replaced with parsed table)
                 if name in ole_preview_names:
                     continue
+                # Skip watermark images (only referenced by headers/footers)
+                if name in header_footer_media:
+                    continue
                 if name not in referenced_names:
                     # Orphan image: add to registry and markdown
                     ext = os.path.splitext(name)[1].lstrip('.')
@@ -786,8 +711,6 @@ def convert_docx_to_markdown(filepath):
                             continue
                     except Exception:
                         continue
-                    if _is_low_info_image(img_data) or _is_blurry_overview(img_data):
-                        continue
                     img_id = _generate_image_id(doc_name, name)
                     image_registry[name] = img_id
                     image_data_map[img_id] = (img_data, ext)
@@ -798,6 +721,9 @@ def convert_docx_to_markdown(filepath):
                 name = os.path.basename(img_path)
                 # Skip OLE Excel preview images
                 if name in ole_preview_names:
+                    continue
+                # Skip watermark images (only referenced by headers/footers)
+                if name in header_footer_media:
                     continue
                 if name in image_registry:
                     img_id = image_registry[name]
@@ -830,10 +756,6 @@ def convert_docx_to_markdown(filepath):
                                 continue
                         except Exception:
                             pass
-                        # Skip low-information background/decorative/blurry images
-                        if _is_low_info_image(img_data) or _is_blurry_overview(img_data):
-                            skipped_ids.append(img_id)
-                            continue
                         image_data_map[img_id] = (img_data, ext)
                     else:
                         skipped_ids.append(img_id)
@@ -852,7 +774,7 @@ def convert_docx_to_markdown(filepath):
 
 def _convert_docx_raw(filepath):
     doc_name = os.path.splitext(os.path.basename(filepath))[0]
-    rid_to_media = _build_rid_to_media(filepath)
+    rid_to_media, header_footer_media = _build_rid_to_media(filepath)
     ole_excel_map = _build_ole_excel_map(filepath)
     ole_preview_names = set(ole_excel_map.keys())
     image_registry = {}
@@ -940,6 +862,9 @@ def _convert_docx_raw(filepath):
                 # Skip OLE Excel preview images
                 if name in ole_preview_names:
                     continue
+                # Skip watermark images (only referenced by headers/footers)
+                if name in header_footer_media:
+                    continue
                 if name not in referenced_names:
                     ext = os.path.splitext(name)[1].lstrip('.')
                     if ext.lower() in ('emf', 'wmf'):
@@ -955,8 +880,6 @@ def _convert_docx_raw(filepath):
                             continue
                     except Exception:
                         continue
-                    if _is_low_info_image(img_data) or _is_blurry_overview(img_data):
-                        continue
                     img_id = _generate_image_id(doc_name, name)
                     image_registry[name] = img_id
                     image_data_map[img_id] = (img_data, ext)
@@ -967,6 +890,9 @@ def _convert_docx_raw(filepath):
                 name = os.path.basename(img_path)
                 # Skip OLE Excel preview images
                 if name in ole_preview_names:
+                    continue
+                # Skip watermark images (only referenced by headers/footers)
+                if name in header_footer_media:
                     continue
                 if name in image_registry:
                     img_id = image_registry[name]
@@ -998,10 +924,6 @@ def _convert_docx_raw(filepath):
                                 continue
                         except Exception:
                             pass
-                        # Skip low-information background/decorative/blurry images
-                        if _is_low_info_image(img_data) or _is_blurry_overview(img_data):
-                            skipped_ids.append(img_id)
-                            continue
                         image_data_map[img_id] = (img_data, ext)
                     else:
                         skipped_ids.append(img_id)
@@ -1477,6 +1399,7 @@ def handle_parse_documents(args):
         existing_state = _load_cache("phase_state.json")
         if existing_state:
             phases = existing_state.get("phases", {})
+            # Check for in-progress image analysis
             img_phase = phases.get("image_analysis", {})
             if img_phase.get("status") == "in_progress":
                 processed = img_phase.get("processed", 0)
@@ -1486,6 +1409,16 @@ def handle_parse_documents(args):
                     f"重新解析会丢失已有进度。如需继续处理，请调用 get_workflow_state 恢复。\n"
                     f"如确认要重新开始，请传入 force=true 参数。"
                 )}], "blocked": True}
+            # Check for existing test cases that would be lost
+            gen_phase = phases.get("generation", {})
+            if gen_phase.get("status") in ("in_progress", "completed"):
+                module_count = gen_phase.get("module_count", 0)
+                if module_count > 0:
+                    return {"content": [{"type": "text", "text": (
+                        f"⚠️ 检测到已生成的测试用例 ({module_count} 个模块)。\n"
+                        f"重新解析会丢失所有已生成的用例。如需继续当前任务，请调用 get_workflow_state 恢复。\n"
+                        f"如确认要重新开始，请传入 force=true 参数。"
+                    )}], "blocked": True}
 
     files = glob.glob(os.path.join(search_dir, "**", pattern), recursive=True)
     if not files:
@@ -1627,7 +1560,7 @@ IMAGE_ANALYSIS_PROMPT = (
     "【核心原则】只提取具体数据，禁止笼统概括。看到表格就逐行抄录，看到流程图就逐条列出路径。\n"
     "【测试视角】重点关注：字段约束（长度、格式、必填）、状态转换条件、边界值、业务规则，这些是设计测试用例的关键依据。\n"
     "【无法识别】如果图片模糊、分辨率过低、内容不清晰导致无法准确提取具体信息，"
-    "请直接输出一行：`[UNREADABLE]` 加上简短原因说明（如 `[UNREADABLE] 图片模糊，文字无法辨认`）。"
+    "请直接输出一行：`[UNREADABLE]` 加上简短原因说明（如 `[UNREADABLE] 图片模糊，文字无法辨认,请忽略`）。"
     "不要猜测或编造内容。"
 )
 
@@ -1992,14 +1925,14 @@ def _get_requirement_name():
         name = os.path.splitext(name)[0]
         # Prefer requirement docs over design docs
         if "需求" in name or "requirement" in name.lower():
-            # Clean up common prefixes like [需求]
-            name = re.sub(r'^\[.*?\]', '', name).strip()
+            # Clean up common prefixes like [需求] or 【主prd】
+            name = re.sub(r'^[\[【].*?[\]】]', '', name).strip()
             if name:
                 return name
     # Fallback: use first doc name
     if md_files:
         name = os.path.splitext(md_files[0].get("name", "test_cases"))[0]
-        name = re.sub(r'^\[.*?\]', '', name).strip()
+        name = re.sub(r'^[\[【].*?[\]】]', '', name).strip()
         return name or "test_cases"
     return "test_cases"
 
