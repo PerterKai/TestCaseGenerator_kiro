@@ -67,7 +67,8 @@ def _http_request(url, method="GET", data=None, headers=None, timeout=15):
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
-    # Allow both http and https
+    # Allow both http and https; disable cert verification for local/self-signed APIs
+    # (common for local LLM servers like LM Studio, Ollama, etc.)
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE

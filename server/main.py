@@ -250,7 +250,7 @@ def _is_blurry_overview(img_data):
         # Resize to standard analysis size (512px wide) for consistent thresholds
         ratio = 512.0 / w
         analyze_img = img.resize((512, int(h * ratio)), Image.LANCZOS).convert('L')
-        aw, ah = analyze_img.size
+        _aw, _ah = analyze_img.size
         pixels = list(analyze_img.getdata())
         n = len(pixels)
         # Check 1: Large dark background ratio (>40% pixels very dark, <40)
@@ -407,9 +407,7 @@ def _build_ole_excel_map(filepath):
             
             # Parse document.xml for w:object elements
             W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-            O_NS = 'urn:schemas-microsoft-com:office:office'
             R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
-            V_NS = 'urn:schemas-microsoft-com:vml'
             
             doc_root = ET.fromstring(z.read('word/document.xml'))
             for obj in doc_root.iter(f'{{{W_NS}}}object'):
@@ -688,16 +686,16 @@ def convert_docx_to_markdown(filepath):
             _zip_handle.close()
         return _convert_docx_raw(filepath)
 
+    # Build element-to-object lookup maps for O(1) access (avoids O(n²) inner loops)
+    para_map = {p._element: p for p in doc.paragraphs}
+    table_map = {t._element: t for t in doc.tables}
+
     # Iterate body elements in order to preserve table positions
     for child in doc.element.body:
         tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
         if tag == 'p':
             # Find the corresponding paragraph object
-            para = None
-            for p in doc.paragraphs:
-                if p._element is child:
-                    para = p
-                    break
+            para = para_map.get(child)
             if para is None:
                 continue
             text = para.text.strip()
@@ -730,11 +728,7 @@ def convert_docx_to_markdown(filepath):
                     md_lines.append("")
         elif tag == 'tbl':
             # Find the corresponding table object
-            tbl = None
-            for t in doc.tables:
-                if t._element is child:
-                    tbl = t
-                    break
+            tbl = table_map.get(child)
             if tbl is not None:
                 md_lines.append("")
                 table_md = _table_to_markdown(tbl, rid_to_media, doc_name, image_registry)
@@ -1378,6 +1372,7 @@ def handle_setup_environment(args):
         pending = testcase_store.get("pending_images", [])
         total_imgs = len(pending)
         processed_imgs = sum(1 for p in pending if p["processed"])
+        skipped_imgs = sum(1 for p in pending if p.get("skipped"))
         modules = testcase_store.get("modules", [])
         total_cases = sum(len(s.get("test_cases", [])) for m in modules for s in m.get("sub_modules", []))
         current_phase = existing_state.get("current_phase", "unknown")
@@ -1386,6 +1381,7 @@ def handle_setup_environment(args):
             "current_phase": current_phase,
             "total_images": total_imgs,
             "processed_images": processed_imgs,
+            "skipped_images": skipped_imgs,
             "unprocessed_images": total_imgs - processed_imgs,
             "module_count": len(modules),
             "total_cases": total_cases,
@@ -1394,7 +1390,8 @@ def handle_setup_environment(args):
         results.append("⚠️ 检测到缓存任务:")
         results.append(f"  当前阶段: {current_phase}")
         if total_imgs > 0:
-            results.append(f"  图片处理: {processed_imgs}/{total_imgs}")
+            skip_note = f" (其中 {skipped_imgs} 张因清晰度跳过)" if skipped_imgs > 0 else ""
+            results.append(f"  图片处理: {processed_imgs}/{total_imgs}{skip_note}")
         if modules:
             results.append(f"  已生成用例: {len(modules)} 模块, {total_cases} 用例")
         results.append("")
@@ -1610,8 +1607,14 @@ IMAGE_ANALYSIS_PROMPT = (
     "6. 其他 → 提取所有可见文字和关键信息。\n\n"
     "【输出格式】先用一行标注图片类型，然后输出提取的具体内容。\n"
     "【核心原则】只提取具体数据，禁止笼统概括。看到表格就逐行抄录，看到流程图就逐条列出路径。\n"
-    "【测试视角】重点关注：字段约束（长度、格式、必填）、状态转换条件、边界值、业务规则，这些是设计测试用例的关键依据。"
+    "【测试视角】重点关注：字段约束（长度、格式、必填）、状态转换条件、边界值、业务规则，这些是设计测试用例的关键依据。\n"
+    "【无法识别】如果图片模糊、分辨率过低、内容不清晰导致无法准确提取具体信息，"
+    "请直接输出一行：`[UNREADABLE]` 加上简短原因说明（如 `[UNREADABLE] 图片模糊，文字无法辨认`）。"
+    "不要猜测或编造内容。"
 )
+
+# Marker returned by LLM when image is unreadable
+_UNREADABLE_MARKER = "[UNREADABLE]"
 
 
 
@@ -1632,6 +1635,7 @@ def handle_get_workflow_state(args):
     pending = testcase_store.get("pending_images", [])
     total_imgs = len(pending)
     processed_imgs = sum(1 for p in pending if p["processed"])
+    skipped_imgs = sum(1 for p in pending if p.get("skipped"))
     unprocessed_imgs = total_imgs - processed_imgs
 
     md_files = testcase_store.get("md_files", [])
@@ -1656,7 +1660,8 @@ def handle_get_workflow_state(args):
         _save_phase_state("image_analysis", "completed")
     lines.append(f"  阶段2 图片分析: {img_status}")
     if total_imgs > 0:
-        lines.append(f"    - {processed_imgs}/{total_imgs} 张已处理, {unprocessed_imgs} 张待处理")
+        skip_note = f", {skipped_imgs} 张跳过(不清晰)" if skipped_imgs > 0 else ""
+        lines.append(f"    - {processed_imgs}/{total_imgs} 张已处理{skip_note}, {unprocessed_imgs} 张待处理")
 
     # Generation phase
     gen_status = phases.get("generation", {}).get("status", "pending")
@@ -1676,7 +1681,7 @@ def handle_get_workflow_state(args):
 
     if has_unprocessed_images:
         lines.append(f"▶ 继续操作: 有 {unprocessed_imgs} 张图片待处理")
-        lines.append(f"  - 调用 configure_llm_api + process_images_with_llm 使用外部LLM批量处理")
+        lines.append("  - 调用 configure_llm_api + process_images_with_llm 使用外部LLM批量处理")
     elif not img_completed and total_imgs > 0:
         lines.append("▶ 继续操作: 调用 process_images_with_llm 检查图片处理状态")
     elif (img_completed or total_imgs == 0) and not has_testcases:
@@ -1684,7 +1689,9 @@ def handle_get_workflow_state(args):
     elif has_testcases and export_status != "completed":
         lines.append("▶ 继续操作: 调用 get_testcases 查看已有用例，可继续生成或调用 review_module_structure 审查模块结构，最后调用 export_xmind 和 export_report 导出")
     elif export_status == "completed":
-        lines.append("▶ 工作流已完成。如需重新生成，请调用 parse_documents(force=true) 重新开始。")
+        lines.append("▶ 已导出 XMind 和测试报告。可以继续修改用例并重新导出，或确认用例完善后结束流程。")
+        lines.append("  - 如需修改用例: 调用 get_testcases 查看当前用例，修改后调用 save_testcases(append_module=...) 保存，再调用 export_xmind + export_report 重新导出")
+        lines.append("  - 如需重新生成: 调用 clear_cache 清除缓存后重新开始")
     elif parse_status == "completed":
         lines.append("▶ 继续操作: 调用 configure_llm_api + process_images_with_llm 开始处理图片")
     else:
@@ -2080,11 +2087,11 @@ def handle_review_module_structure(args):
     # Build report
     total_cases = sum(s[1] for s in module_sizes)
     lines = [
-        f"📊 模块结构审查报告",
-        f"",
+        "📊 模块结构审查报告",
+        "",
         f"总计: {len(modules)} 个模块, {total_cases} 个用例",
-        f"",
-        f"模块统计:",
+        "",
+        "模块统计:",
     ]
     lines.extend(stats)
 
@@ -2099,7 +2106,7 @@ def handle_review_module_structure(args):
     if not issues and not suggestions:
         lines.append("\n✅ 模块结构合理，未发现明显问题。")
 
-    lines.append(f"\n如需调整模块结构，请修改后调用 save_testcases(modules=修改后的全部用例数组) 保存。")
+    lines.append(f"\n如需调整模块结构，请对需要修改的模块逐个调用 save_testcases(append_module=调整后的单个模块对象) 保存。")
 
     return {
         "content": [{"type": "text", "text": "\n".join(lines)}],
@@ -2108,6 +2115,28 @@ def handle_review_module_structure(args):
         "issue_count": len(issues),
         "suggestion_count": len(suggestions),
     }
+
+
+# Coverage dimension keywords for test case classification
+_COVERAGE_DIMS = {
+    "正向": ["正常", "正向", "成功", "默认"],
+    "边界": ["边界", "最大", "最小", "上限", "下限", "空"],
+    "异常": ["异常", "失败", "错误", "不存在", "无效", "非法", "超", "缺少"],
+    "安全": ["安全", "认证", "授权", "权限", "注入", "xss"],
+    "性能": ["并发", "性能", "大数据", "批量"],
+}
+
+
+def _classify_case_dimensions(case):
+    """Classify a test case into coverage dimensions based on keywords."""
+    title = case.get("title", "").lower()
+    steps_text = " ".join(case.get("steps", [])).lower()
+    combined = title + " " + steps_text
+    dims = set()
+    for dim, keywords in _COVERAGE_DIMS.items():
+        if any(kw in combined for kw in keywords):
+            dims.add(dim)
+    return dims
 
 
 def handle_export_report(args):
@@ -2128,20 +2157,20 @@ def handle_export_report(args):
     total_subs = sum(len(m.get("sub_modules", [])) for m in modules)
 
     lines = [
-        f"# 测试用例生成报告",
-        f"",
-        f"## 基本信息",
-        f"",
-        f"| 项目 | 内容 |",
-        f"|------|------|",
+        "# 测试用例生成报告",
+        "",
+        "## 基本信息",
+        "",
+        "| 项目 | 内容 |",
+        "|------|------|",
         f"| 需求名称 | {req_name} |",
         f"| 模块数量 | {len(modules)} |",
         f"| 子模块数量 | {total_subs} |",
         f"| 用例总数 | {total_cases} |",
         f"| XMind文件 | {req_name}_testCase.xmind |",
-        f"",
-        f"## 用例覆盖概览",
-        f"",
+        "",
+        "## 用例覆盖概览",
+        "",
     ]
 
     # Per-module breakdown
@@ -2149,69 +2178,46 @@ def handle_export_report(args):
         subs = m.get("sub_modules", [])
         mod_total = sum(len(s.get("test_cases", [])) for s in subs)
         lines.append(f"### {m['name']} ({mod_total} 个用例)")
-        lines.append(f"")
-        lines.append(f"| 子模块 | 用例数 | 覆盖维度 |")
-        lines.append(f"|--------|--------|----------|")
+        lines.append("")
+        lines.append("| 子模块 | 用例数 | 覆盖维度 |")
+        lines.append("|--------|--------|----------|")
         for s in subs:
             cases = s.get("test_cases", [])
             # Analyze coverage dimensions
             dimensions = set()
             for c in cases:
-                title = c.get("title", "").lower()
-                steps_text = " ".join(c.get("steps", [])).lower()
-                combined = title + " " + steps_text
-                if any(kw in combined for kw in ["正常", "正向", "成功", "默认"]):
-                    dimensions.add("正向")
-                if any(kw in combined for kw in ["边界", "最大", "最小", "上限", "下限", "空"]):
-                    dimensions.add("边界")
-                if any(kw in combined for kw in ["异常", "失败", "错误", "不存在", "无效", "非法", "超", "缺少"]):
-                    dimensions.add("异常")
-                if any(kw in combined for kw in ["安全", "认证", "授权", "权限", "注入", "xss"]):
-                    dimensions.add("安全")
-                if any(kw in combined for kw in ["并发", "性能", "大数据", "批量"]):
-                    dimensions.add("性能")
+                dimensions.update(_classify_case_dimensions(c))
             dim_str = ", ".join(sorted(dimensions)) if dimensions else "正向"
             lines.append(f"| {s['name']} | {len(cases)} | {dim_str} |")
-        lines.append(f"")
+        lines.append("")
 
     # Coverage dimension summary
-    all_dims = {"正向": 0, "边界": 0, "异常": 0, "安全": 0, "性能": 0}
+    all_dims = {dim: 0 for dim in _COVERAGE_DIMS}
     for m in modules:
         for s in m.get("sub_modules", []):
             for c in s.get("test_cases", []):
-                title = c.get("title", "").lower()
-                steps_text = " ".join(c.get("steps", [])).lower()
-                combined = title + " " + steps_text
-                if any(kw in combined for kw in ["正常", "正向", "成功", "默认"]):
-                    all_dims["正向"] += 1
-                if any(kw in combined for kw in ["边界", "最大", "最小", "上限", "下限", "空"]):
-                    all_dims["边界"] += 1
-                if any(kw in combined for kw in ["异常", "失败", "错误", "不存在", "无效", "非法", "超", "缺少"]):
-                    all_dims["异常"] += 1
-                if any(kw in combined for kw in ["安全", "认证", "授权", "权限", "注入", "xss"]):
-                    all_dims["安全"] += 1
-                if any(kw in combined for kw in ["并发", "性能", "大数据", "批量"]):
-                    all_dims["性能"] += 1
+                for dim in _classify_case_dimensions(c):
+                    all_dims[dim] += 1
 
-    lines.append(f"## 覆盖维度统计")
-    lines.append(f"")
-    lines.append(f"| 维度 | 用例数 | 占比 |")
-    lines.append(f"|------|--------|------|")
+    lines.append("## 覆盖维度统计")
+    lines.append("")
+    lines.append("| 维度 | 用例数 | 占比 |")
+    lines.append("|------|--------|------|")
     for dim, count in sorted(all_dims.items(), key=lambda x: -x[1]):
         pct = f"{count / total_cases * 100:.1f}%" if total_cases > 0 else "0%"
         lines.append(f"| {dim} | {count} | {pct} |")
-    lines.append(f"")
+    lines.append("")
 
     # Questions / confirmation points
     if questions:
-        lines.append(f"## 需求疑问点与确认项")
-        lines.append(f"")
+        lines.append("## 需求疑问点与确认项")
+        lines.append("")
         for i, q in enumerate(questions, 1):
             lines.append(f"{i}. {q}")
-        lines.append(f"")
+        lines.append("")
 
-    lines.append(f"---")
-    lines.append(f"*报告由 TestCase Generator 自动生成*")
+    lines.append("---")
+    lines.append("*报告由 TestCase Generator 自动生成*")
 
     report_content = "\n".join(lines)
     report_filename = f"{req_name}_testCaseReport.md"
@@ -2302,7 +2308,13 @@ def handle_configure_llm_api(args):
 
 
 def _process_single_image(img_info, api_url, api_key, model, prompt):
-    """Process a single image with external LLM. Returns (img_id, success, result_text)."""
+    """Process a single image with external LLM.
+    
+    Returns (img_id, status, result_text) where status is:
+    - 'ok': successfully analyzed
+    - 'skipped': LLM reported image unreadable/unclear
+    - 'error': processing failed
+    """
     img_id = img_info["id"]
     img_file_path = img_info["path"]
     rel_path = img_info.get("rel_path", os.path.join(".tmp", "picture", img_info["filename"]))
@@ -2314,7 +2326,7 @@ def _process_single_image(img_info, api_url, api_key, model, prompt):
         img_file_path = os.path.join(TMP_PIC_DIR, img_info["filename"])
 
     if not os.path.exists(img_file_path):
-        return img_id, False, f"图片文件不存在: {img_file_path}"
+        return img_id, 'error', f"图片文件不存在: {img_file_path}"
 
     try:
         with open(img_file_path, 'rb') as f:
@@ -2329,17 +2341,29 @@ def _process_single_image(img_info, api_url, api_key, model, prompt):
         from gui_llm_config import call_llm_vision
 
         ok, result = call_llm_vision(api_url, api_key, model, b64, mime, prompt, timeout=120)
-        return img_id, ok, result
+        if not ok:
+            return img_id, 'error', result
+
+        # Check if LLM reported the image as unreadable
+        result_stripped = result.strip()
+        if result_stripped.startswith(_UNREADABLE_MARKER):
+            reason = result_stripped[len(_UNREADABLE_MARKER):].strip()
+            return img_id, 'skipped', reason or "图片清晰度不足，无法准确解析"
+
+        return img_id, 'ok', result
     except Exception as e:
-        return img_id, False, f"处理异常: {e}"
+        return img_id, 'error', f"处理异常: {e}"
 
 
 # Lock for thread-safe markdown file writes (used by multi-threaded LLM processing)
 _md_write_lock = threading.Lock()
 
 
-def _write_image_result_to_md(img_info, analysis):
-    """Write image analysis result back to markdown file. Thread-safe."""
+def _write_image_result_to_md(img_info, analysis, skipped=False):
+    """Write image analysis result back to markdown file. Thread-safe.
+    
+    If skipped=True, writes a skip annotation instead of analysis content.
+    """
     source_doc = img_info["source_doc"]
     img_id = img_info["id"]
     md_path = os.path.join(TMP_DOC_DIR, f"{source_doc}.md")
@@ -2348,7 +2372,10 @@ def _write_image_result_to_md(img_info, analysis):
         return False, f"Markdown 文件不存在: {md_path}"
 
     placeholder = f"{{{{IMG:{img_id}}}}}"
-    replacement = f"<!-- 图片分析: {img_info['filename']} -->\n{analysis}\n<!-- /图片分析 -->"
+    if skipped:
+        replacement = f"<!-- 已跳过(图片不清晰): {img_info['filename']} — {analysis} -->"
+    else:
+        replacement = f"<!-- 图片分析: {img_info['filename']} -->\n{analysis}\n<!-- /图片分析 -->"
 
     try:
         with _md_write_lock:
@@ -2416,6 +2443,7 @@ def handle_process_images_with_llm(args):
     results_log = []
     success_count = 0
     fail_count = 0
+    skip_count = 0
 
     if enable_mt and len(to_process) > 1:
         # Multi-threaded processing
@@ -2432,8 +2460,8 @@ def handle_process_images_with_llm(args):
             for future in concurrent.futures.as_completed(future_to_img):
                 img = future_to_img[future]
                 try:
-                    img_id, ok, result_text = future.result()
-                    if ok:
+                    img_id, status, result_text = future.result()
+                    if status == 'ok':
                         wrote_ok, write_msg = _write_image_result_to_md(img, result_text)
                         img["processed"] = True
                         success_count += 1
@@ -2441,6 +2469,12 @@ def handle_process_images_with_llm(args):
                             results_log.append(f"  ⚠ [{img_id}] LLM成功但写入失败: {write_msg}")
                         else:
                             results_log.append(f"  ✓ [{img_id}] 处理成功")
+                    elif status == 'skipped':
+                        _write_image_result_to_md(img, result_text, skipped=True)
+                        img["processed"] = True
+                        img["skipped"] = True
+                        skip_count += 1
+                        results_log.append(f"  ⏭ [{img_id}] 已跳过: {result_text[:100]}")
                     else:
                         fail_count += 1
                         results_log.append(f"  ✗ [{img_id}] {result_text[:200]}")
@@ -2452,15 +2486,21 @@ def handle_process_images_with_llm(args):
         results_log.append(f"📝 顺序处理 {len(to_process)} 张图片\n")
         for i, img in enumerate(to_process, 1):
             results_log.append(f"  [{i}/{len(to_process)}] 处理 {img['id']} ...")
-            img_id, ok, result_text = _process_single_image(img, api_url, api_key, model, prompt)
-            if ok:
+            img_id, status, result_text = _process_single_image(img, api_url, api_key, model, prompt)
+            if status == 'ok':
                 wrote_ok, write_msg = _write_image_result_to_md(img, result_text)
                 img["processed"] = True
                 success_count += 1
                 if not wrote_ok:
                     results_log.append(f"    ⚠ LLM成功但写入失败: {write_msg}")
                 else:
-                    results_log.append(f"    ✓ 成功")
+                    results_log.append("    ✓ 成功")
+            elif status == 'skipped':
+                _write_image_result_to_md(img, result_text, skipped=True)
+                img["processed"] = True
+                img["skipped"] = True
+                skip_count += 1
+                results_log.append(f"    ⏭ 已跳过: {result_text[:100]}")
             else:
                 fail_count += 1
                 results_log.append(f"    ✗ {result_text[:200]}")
@@ -2469,12 +2509,16 @@ def handle_process_images_with_llm(args):
     _sync_store_to_cache()
     total = len(pending)
     processed = sum(1 for p in pending if p["processed"])
+    skipped_total = sum(1 for p in pending if p.get("skipped"))
     _save_phase_state("image_analysis", "completed" if processed == total else "in_progress", {
         "total": total,
         "processed": processed,
+        "skipped": skipped_total,
     })
 
-    results_log.append(f"\n处理完成: {success_count} 成功, {fail_count} 失败, 总进度 {processed}/{total}")
+    results_log.append(f"\n处理完成: {success_count} 成功, {skip_count} 跳过(不清晰), {fail_count} 失败, 总进度 {processed}/{total}")
+    if skipped_total > 0:
+        results_log.append(f"  ⏭ 共 {skipped_total} 张图片因清晰度问题被跳过，不影响后续用例生成。")
     if processed == total:
         results_log.append("\n所有图片已处理完毕！请调用 get_doc_summary 获取文档结构概览。")
     elif fail_count > 0:
@@ -2483,6 +2527,7 @@ def handle_process_images_with_llm(args):
     return {
         "content": [{"type": "text", "text": "\n".join(results_log)}],
         "success_count": success_count,
+        "skip_count": skip_count,
         "fail_count": fail_count,
         "total_processed": processed,
         "total_images": total,
@@ -2526,7 +2571,7 @@ def handle_request(req):
             "serverInfo": {"name": "testcase-generator", "version": "7.0.0"}
         })
     elif method == "notifications/initialized":
-        pass
+        pass  # No response needed for notifications
     elif method == "tools/list":
         send_response(rid, {"tools": TOOLS})
     elif method == "tools/call":
