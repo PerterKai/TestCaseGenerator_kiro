@@ -362,6 +362,126 @@ def _build_rid_to_media(filepath):
     return rid_to_media
 
 
+def _build_ole_excel_map(filepath):
+    """Build mapping: preview_image_rId -> xlsx_zip_path for embedded Excel objects.
+    
+    In docx, embedded Excel tables appear as w:object containing:
+    - v:shape > v:imagedata (preview image, rId -> media/imageX.png)
+    - o:OLEObject with ProgID=Excel.Sheet.12 (rId -> embeddings/xxx.xlsx)
+    
+    Returns dict: {preview_image_media_name: xlsx_zip_path}
+    """
+    ole_map = {}  # media_name -> xlsx_zip_path
+    try:
+        with zipfile.ZipFile(filepath, 'r') as z:
+            if 'word/document.xml' not in z.namelist():
+                return ole_map
+            
+            # Build rId -> target mapping from rels
+            rid_to_target = {}
+            rels_path = 'word/_rels/document.xml.rels'
+            if rels_path in z.namelist():
+                rels_root = ET.fromstring(z.read(rels_path))
+                for rel in rels_root:
+                    rid_to_target[rel.get('Id', '')] = rel.get('Target', '')
+            
+            # Parse document.xml for w:object elements
+            W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+            O_NS = 'urn:schemas-microsoft-com:office:office'
+            R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+            V_NS = 'urn:schemas-microsoft-com:vml'
+            
+            doc_root = ET.fromstring(z.read('word/document.xml'))
+            for obj in doc_root.iter(f'{{{W_NS}}}object'):
+                ole_elem = None
+                img_rid = None
+                
+                for child in obj:
+                    tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+                    if tag == 'OLEObject':
+                        prog_id = child.get('ProgID', '')
+                        if prog_id.startswith('Excel.'):
+                            ole_rid = child.get(f'{{{R_NS}}}id', '')
+                            ole_elem = child
+                    elif tag == 'shape':
+                        for sub in child:
+                            sub_tag = sub.tag.split('}')[-1] if '}' in sub.tag else sub.tag
+                            if sub_tag == 'imagedata':
+                                img_rid = sub.get(f'{{{R_NS}}}id', '')
+                
+                if ole_elem is not None and img_rid:
+                    ole_rid = ole_elem.get(f'{{{R_NS}}}id', '')
+                    ole_target = rid_to_target.get(ole_rid, '')
+                    img_target = rid_to_target.get(img_rid, '')
+                    
+                    if ole_target and img_target:
+                        # img_target is like "media/image1.png"
+                        img_media_name = img_target.split('/')[-1]
+                        # ole_target is like "embeddings/xxx.xlsx"
+                        xlsx_path = 'word/' + ole_target if not ole_target.startswith('word/') else ole_target
+                        if xlsx_path in z.namelist():
+                            ole_map[img_media_name] = xlsx_path
+                            sys.stderr.write(f"[MCP] OLE Excel detected: {img_media_name} -> {xlsx_path}\n")
+                            sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"[MCP] OLE Excel map error: {e}\n")
+        sys.stderr.flush()
+    return ole_map
+
+
+def _parse_embedded_xlsx(z, xlsx_zip_path):
+    """Parse an embedded xlsx file from the docx zip into markdown table(s).
+    
+    Returns markdown string with table content, or empty string on failure.
+    """
+    try:
+        _ensure_pkg("openpyxl", "openpyxl")
+        import openpyxl
+        
+        xlsx_data = z.read(xlsx_zip_path)
+        wb = openpyxl.load_workbook(BytesIO(xlsx_data), data_only=True)
+        md_parts = []
+        
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows = []
+            max_row = min(ws.max_row or 0, 200)  # Safety cap
+            for row in ws.iter_rows(min_row=1, max_row=max_row, values_only=True):
+                cells = [str(c).replace('\n', ' ').replace('|', '\\|') if c is not None else "" for c in row]
+                # Trim trailing empty cells
+                while cells and cells[-1] == "":
+                    cells.pop()
+                if cells:
+                    rows.append(cells)
+            
+            if not rows:
+                continue
+            
+            # Normalize column count
+            max_cols = max(len(r) for r in rows)
+            for r in rows:
+                while len(r) < max_cols:
+                    r.append("")
+            
+            # Build markdown table
+            lines = []
+            if len(wb.sheetnames) > 1:
+                lines.append(f"**{sheet_name}**")
+                lines.append("")
+            lines.append("| " + " | ".join(rows[0]) + " |")
+            lines.append("| " + " | ".join(["---"] * max_cols) + " |")
+            for row in rows[1:]:
+                lines.append("| " + " | ".join(row[:max_cols]) + " |")
+            md_parts.append("\n".join(lines))
+        
+        wb.close()
+        return "\n\n".join(md_parts)
+    except Exception as e:
+        sys.stderr.write(f"[MCP] xlsx parse error ({xlsx_zip_path}): {e}\n")
+        sys.stderr.flush()
+        return ""
+
+
 def _find_images_in_element(elem, rid_to_media):
     A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
     R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
@@ -523,16 +643,29 @@ def _table_to_markdown(table, rid_to_media, doc_name, image_registry):
 def convert_docx_to_markdown(filepath):
     doc_name = os.path.splitext(os.path.basename(filepath))[0]
     rid_to_media = _build_rid_to_media(filepath)
+    ole_excel_map = _build_ole_excel_map(filepath)  # preview_image_name -> xlsx_zip_path
+    ole_preview_names = set(ole_excel_map.keys())  # image names to skip (replaced by table)
     image_registry = {}
     image_data_map = {}
     md_lines = [f"# {doc_name}", ""]
+
+    # Pre-open zip for xlsx parsing during body iteration
+    _zip_handle = None
+    try:
+        _zip_handle = zipfile.ZipFile(filepath, 'r')
+    except Exception:
+        pass
 
     try:
         from docx import Document
         doc = Document(filepath)
     except ImportError:
+        if _zip_handle:
+            _zip_handle.close()
         return _convert_docx_raw(filepath)
     except Exception:
+        if _zip_handle:
+            _zip_handle.close()
         return _convert_docx_raw(filepath)
 
     # Iterate body elements in order to preserve table positions
@@ -560,6 +693,17 @@ def convert_docx_to_markdown(filepath):
                     md_lines.append("")
             if para_images:
                 for img_name in para_images:
+                    # Check if this image is a preview of an embedded Excel table
+                    if img_name in ole_preview_names and _zip_handle:
+                        xlsx_path = ole_excel_map[img_name]
+                        table_md = _parse_embedded_xlsx(_zip_handle, xlsx_path)
+                        if table_md:
+                            md_lines.append("")
+                            md_lines.append(f"<!-- 内嵌电子表格: {xlsx_path.split('/')[-1]} -->")
+                            md_lines.append(table_md)
+                            md_lines.append("<!-- /内嵌电子表格 -->")
+                            md_lines.append("")
+                            continue
                     img_id = _generate_image_id(doc_name, img_name)
                     image_registry[img_name] = img_id
                     md_lines.append(f"{{{{IMG:{img_id}}}}}")
@@ -578,6 +722,11 @@ def convert_docx_to_markdown(filepath):
                     md_lines.append(table_md)
                     md_lines.append("")
 
+    # Close the pre-opened zip handle (no longer needed after body iteration)
+    if _zip_handle:
+        _zip_handle.close()
+        _zip_handle = None
+
     try:
         with zipfile.ZipFile(filepath, 'r') as z:
             media = [n for n in z.namelist() if n.startswith('word/media/')]
@@ -587,6 +736,9 @@ def convert_docx_to_markdown(filepath):
             referenced_names = set(image_registry.keys())
             for img_path in media:
                 name = os.path.basename(img_path)
+                # Skip OLE Excel preview images (already replaced with parsed table)
+                if name in ole_preview_names:
+                    continue
                 if name not in referenced_names:
                     # Orphan image: add to registry and markdown
                     ext = os.path.splitext(name)[1].lstrip('.')
@@ -613,6 +765,9 @@ def convert_docx_to_markdown(filepath):
 
             for img_path in media:
                 name = os.path.basename(img_path)
+                # Skip OLE Excel preview images
+                if name in ole_preview_names:
+                    continue
                 if name in image_registry:
                     img_id = image_registry[name]
                     if img_id in image_data_map:
@@ -667,6 +822,8 @@ def convert_docx_to_markdown(filepath):
 def _convert_docx_raw(filepath):
     doc_name = os.path.splitext(os.path.basename(filepath))[0]
     rid_to_media = _build_rid_to_media(filepath)
+    ole_excel_map = _build_ole_excel_map(filepath)
+    ole_preview_names = set(ole_excel_map.keys())
     image_registry = {}
     image_data_map = {}
     md_lines = [f"# {doc_name}", ""]
@@ -703,6 +860,17 @@ def _convert_docx_raw(filepath):
                                 md_lines.append("")
                         para_images = _find_images_in_element(child, rid_to_media)
                         for img_name in para_images:
+                            # Check if this is an OLE Excel preview image
+                            if img_name in ole_preview_names:
+                                xlsx_path = ole_excel_map[img_name]
+                                table_md = _parse_embedded_xlsx(z, xlsx_path)
+                                if table_md:
+                                    md_lines.append("")
+                                    md_lines.append(f"<!-- 内嵌电子表格: {xlsx_path.split('/')[-1]} -->")
+                                    md_lines.append(table_md)
+                                    md_lines.append("<!-- /内嵌电子表格 -->")
+                                    md_lines.append("")
+                                    continue
                             img_id = _generate_image_id(doc_name, img_name)
                             image_registry[img_name] = img_id
                             md_lines.append(f"{{{{IMG:{img_id}}}}}")
@@ -737,6 +905,9 @@ def _convert_docx_raw(filepath):
             referenced_names = set(image_registry.keys())
             for img_path in media:
                 name = os.path.basename(img_path)
+                # Skip OLE Excel preview images
+                if name in ole_preview_names:
+                    continue
                 if name not in referenced_names:
                     ext = os.path.splitext(name)[1].lstrip('.')
                     if ext.lower() in ('emf', 'wmf'):
@@ -762,6 +933,9 @@ def _convert_docx_raw(filepath):
 
             for img_path in media:
                 name = os.path.basename(img_path)
+                # Skip OLE Excel preview images
+                if name in ole_preview_names:
+                    continue
                 if name in image_registry:
                     img_id = image_registry[name]
                     if img_id in image_data_map:
@@ -1137,7 +1311,7 @@ def handle_setup_environment(args):
     results.append(f"Python {sys.version.split()[0]}")
 
     # 1. Check Python dependencies
-    deps = {"docx": "python-docx", "PIL": "Pillow"}
+    deps = {"docx": "python-docx", "PIL": "Pillow", "openpyxl": "openpyxl"}
     for imp, pip_name in deps.items():
         try:
             __import__(imp)
