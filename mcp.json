@@ -14,8 +14,6 @@
         "setup_environment",
         "clear_cache",
         "parse_documents",
-        "get_pending_image",
-        "submit_image_result",
         "get_workflow_state",
         "get_doc_summary",
         "get_doc_section",
@@ -24,7 +22,9 @@
         "get_testcases",
         "export_xmind",
         "review_module_structure",
-        "export_report"
+        "export_report",
+        "configure_llm_api",
+        "process_images_with_llm"
       ]
     }
   }

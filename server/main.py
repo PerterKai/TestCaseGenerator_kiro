@@ -726,7 +726,6 @@ testcase_store = {
     "modules": [],
     "pending_images": [],
     "md_files": [],
-    "session_image_count": 0,  # images processed in current session (not persisted)
 }
 
 
@@ -929,23 +928,7 @@ TOOLS = [
             "required": []
         }
     },
-    {
-        "name": "get_pending_image",
-        "description": "Get the next unprocessed image for vision analysis. Returns one image at a time (base64). After analyzing, call submit_image_result with the result. Progress is auto-saved for cross-session resume.",
-        "inputSchema": {"type": "object", "properties": {}, "required": []}
-    },
-    {
-        "name": "submit_image_result",
-        "description": "Submit vision analysis result for an image. Writes result back to markdown file replacing {{IMG:id}} placeholder. Progress is auto-saved to cache.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "image_id": {"type": "string", "description": "The unique image ID (from get_pending_image)"},
-                "analysis": {"type": "string", "description": "The analysis result text describing image content"}
-            },
-            "required": ["image_id", "analysis"]
-        }
-    },
+
     {
         "name": "get_workflow_state",
         "description": "Get current workflow state for session resume. Returns phase progress, pending work, and resume instructions. Call this at the start of a new session to continue previous work.",
@@ -1168,7 +1151,6 @@ def handle_clear_cache(args):
     testcase_store["modules"] = []
     testcase_store["pending_images"] = []
     testcase_store["md_files"] = []
-    testcase_store["session_image_count"] = 0
 
     msg = "✓ 缓存已清除:\n  " + "\n  ".join(cleared) if cleared else "没有需要清除的缓存。"
     msg += "\n\n可以开始新的用例生成任务了。请确认文档已放入 doc/ 目录，然后调用 parse_documents 开始。"
@@ -1223,7 +1205,6 @@ def handle_parse_documents(args):
     testcase_store["modules"] = []
     testcase_store["pending_images"] = []
     testcase_store["md_files"] = []
-    testcase_store["session_image_count"] = 0
 
     # Initialize clean phase state
     _reset_phase_state()
@@ -1288,9 +1269,8 @@ def handle_parse_documents(args):
                f"  图片文件: {total_imgs} 张 → {TMP_PIC_DIR}\n"
                f"  缓存目录: {TMP_CACHE_DIR}\n")
     if total_imgs > 0:
-        summary += ("\n图片处理方式（二选一）：\n"
-                    "  方式A（推荐）: 调用 configure_llm_api 配置外部LLM，然后调用 process_images_with_llm 批量处理\n"
-                    "  方式B: 逐一调用 get_pending_image 获取图片，用视觉能力分析后调用 submit_image_result 提交结果\n"
+        summary += ("\n图片处理：\n"
+                    "  调用 configure_llm_api 配置外部多模态LLM API，然后调用 process_images_with_llm 批量处理\n"
                     "全部处理完成后调用 get_doc_summary 获取文档结构概览。")
     else:
         summary += "\n无需处理图片，可直接调用 get_doc_summary 获取文档结构概览。"
@@ -1313,174 +1293,7 @@ IMAGE_ANALYSIS_PROMPT = (
 )
 
 
-def handle_get_pending_image(args):
-    pending = testcase_store.get("pending_images", [])
-    if not pending:
-        # Try restore from cache
-        _restore_store_from_cache()
-        pending = testcase_store.get("pending_images", [])
-    if not pending:
-        return {"content": [{"type": "text", "text": "No documents parsed yet. Call parse_documents first."}]}
 
-    next_img = None
-    for img in pending:
-        if not img["processed"]:
-            next_img = img
-            break
-
-    if next_img is None:
-        _save_phase_state("image_analysis", "completed")
-        return {
-            "content": [{"type": "text", "text": "所有图片已处理完毕！请调用 get_doc_summary 获取文档结构概览，然后按模块调用 get_doc_section 分段读取内容生成测试用例。"}],
-            "all_processed": True
-        }
-
-    # Resolve image file path: try absolute path first, then relative path from workspace
-    img_file_path = next_img["path"]
-    rel_path = next_img.get("rel_path", os.path.join(".tmp", "picture", next_img["filename"]))
-    if not os.path.exists(img_file_path):
-        # Fallback: reconstruct from workspace + relative path
-        img_file_path = os.path.join(_workspace(), rel_path)
-    if not os.path.exists(img_file_path):
-        # Last resort: try TMP_PIC_DIR directly
-        img_file_path = os.path.join(TMP_PIC_DIR, next_img["filename"])
-
-    try:
-        with open(img_file_path, 'rb') as f:
-            img_data = f.read()
-        b64 = base64.b64encode(img_data).decode('ascii')
-    except Exception as e:
-        return {"content": [{"type": "text", "text": (
-            f"Error reading image: {e}\n"
-            f"Tried paths:\n"
-            f"  1. {next_img['path']}\n"
-            f"  2. {os.path.join(_workspace(), rel_path)}\n"
-            f"  3. {os.path.join(TMP_PIC_DIR, next_img['filename'])}\n"
-            f"Image ID: {next_img['id']}\n"
-            f"Relative path: {rel_path}\n"
-            f"请确认工作区路径正确且图片文件存在。"
-        )}]}
-
-    total = len(pending)
-    processed = sum(1 for p in pending if p["processed"])
-    remaining = total - processed - 1
-
-    mime = next_img["mime"]
-
-    text_info = (
-        f"[{processed + 1}/{total}] 图片ID: {next_img['id']}\n"
-        f"图片文件: {rel_path}\n\n"
-        f"{IMAGE_ANALYSIS_PROMPT}\n\n"
-        f"分析完成后调用 submit_image_result(image_id=\"{next_img['id']}\", analysis=\"你的分析结果\")"
-    )
-
-    # Return image via MCP image content (spec-compliant).
-    # If the MCP client does not relay image content to the agent's multimodal
-    # input, the agent should ask the user to drag the image file into chat
-    # using the relative path provided in text_info and image_path field.
-    content_parts = [
-        {"type": "text", "text": text_info},
-        {"type": "image", "data": b64, "mimeType": mime}
-    ]
-
-    result = {
-        "content": content_parts,
-        "image_id": next_img["id"],
-        "image_path": rel_path,
-        "total_images": total,
-        "processed_count": processed,
-        "remaining": remaining + 1,
-    }
-
-    if remaining > 0:
-        content_parts.append({"type": "text", "text": f"提交后还剩 {remaining} 张待处理。"})
-
-    return result
-
-def handle_submit_image_result(args):
-    image_id = args.get("image_id", "")
-    analysis = args.get("analysis", "")
-
-    if not image_id:
-        return {"content": [{"type": "text", "text": "Missing required parameter: image_id"}]}
-    if not analysis:
-        return {"content": [{"type": "text", "text": "Missing required parameter: analysis"}]}
-
-    pending = testcase_store.get("pending_images", [])
-    if not pending:
-        _restore_store_from_cache()
-        pending = testcase_store.get("pending_images", [])
-
-    target = None
-    for img in pending:
-        if img["id"] == image_id:
-            target = img
-            break
-
-    if target is None:
-        return {"content": [{"type": "text", "text": f"Image ID not found: {image_id}"}]}
-    if target["processed"]:
-        return {"content": [{"type": "text", "text": f"Image {image_id} already processed."}]}
-
-    source_doc = target["source_doc"]
-    md_path = os.path.join(TMP_DOC_DIR, f"{source_doc}.md")
-
-    if not os.path.exists(md_path):
-        return {"content": [{"type": "text", "text": f"Markdown file not found: {md_path}"}]}
-
-    try:
-        with open(md_path, 'r', encoding='utf-8') as f:
-            md_content = f.read()
-
-        placeholder = f"{{{{IMG:{image_id}}}}}"
-        replacement = f"<!-- 图片分析: {target['filename']} -->\n{analysis}\n<!-- /图片分析 -->"
-
-        if placeholder in md_content:
-            md_content = md_content.replace(placeholder, replacement)
-            with open(md_path, 'w', encoding='utf-8') as f:
-                f.write(md_content)
-            target["processed"] = True
-        else:
-            base_id = os.path.splitext(image_id)[0]
-            found = False
-            for pattern_try in [f"{{{{IMG:{base_id}.png}}}}", f"{{{{IMG:{base_id}.jpg}}}}", f"{{{{IMG:{base_id}.jpeg}}}}"]:
-                if pattern_try in md_content:
-                    md_content = md_content.replace(pattern_try, replacement)
-                    with open(md_path, 'w', encoding='utf-8') as f:
-                        f.write(md_content)
-                    target["processed"] = True
-                    found = True
-                    break
-            if not found:
-                target["processed"] = True
-                return {"content": [{"type": "text", "text": f"Warning: placeholder {{{{IMG:{image_id}}}}} not found in {md_path}. Marked as processed."}]}
-    except Exception as e:
-        return {"content": [{"type": "text", "text": f"Error updating markdown: {e}"}]}
-
-    # Persist progress
-    _sync_store_to_cache()
-    testcase_store["session_image_count"] += 1
-    _save_phase_state("image_analysis", "in_progress", {
-        "total": len(pending),
-        "processed": sum(1 for p in pending if p["processed"]),
-    })
-
-    total = len(pending)
-    processed = sum(1 for p in pending if p["processed"])
-    remaining = total - processed
-
-    msg = f"✓ 已将图片 [{image_id}] 的分析结果写入 {source_doc}.md ({processed}/{total} 已处理)"
-    if remaining > 0:
-        msg += f"\n请继续调用 get_pending_image 获取下一张图片。"
-    else:
-        msg += "\n所有图片已处理完毕！请调用 get_doc_summary 获取文档结构概览。"
-
-    return {
-        "content": [{"type": "text", "text": msg}],
-        "processed_count": processed,
-        "total_images": total,
-        "remaining": remaining
-    }
 
 def handle_get_workflow_state(args):
     """Return current workflow state for session resume."""
@@ -1541,11 +1354,10 @@ def handle_get_workflow_state(args):
     has_testcases = total_cases > 0
 
     if has_unprocessed_images:
-        lines.append(f"▶ 继续操作: 有 {unprocessed_imgs} 张图片待处理，可选择：")
-        lines.append(f"  - 调用 configure_llm_api + process_images_with_llm 使用外部LLM批量处理（推荐）")
-        lines.append(f"  - 调用 get_pending_image 使用内置视觉逐一处理")
+        lines.append(f"▶ 继续操作: 有 {unprocessed_imgs} 张图片待处理")
+        lines.append(f"  - 调用 configure_llm_api + process_images_with_llm 使用外部LLM批量处理")
     elif not img_completed and total_imgs > 0:
-        lines.append("▶ 继续操作: 调用 get_pending_image 或 process_images_with_llm 检查图片处理状态")
+        lines.append("▶ 继续操作: 调用 process_images_with_llm 检查图片处理状态")
     elif (img_completed or total_imgs == 0) and not has_testcases:
         lines.append("▶ 继续操作: 调用 get_doc_summary 获取文档结构，然后按模块生成测试用例")
     elif has_testcases and export_status != "completed":
@@ -1553,7 +1365,7 @@ def handle_get_workflow_state(args):
     elif export_status == "completed":
         lines.append("▶ 工作流已完成。如需重新生成，请调用 parse_documents(force=true) 重新开始。")
     elif parse_status == "completed":
-        lines.append("▶ 继续操作: 调用 get_pending_image 开始处理图片")
+        lines.append("▶ 继续操作: 调用 configure_llm_api + process_images_with_llm 开始处理图片")
     else:
         lines.append("▶ 继续操作: 调用 parse_documents 开始新的工作流")
 
@@ -2339,8 +2151,6 @@ HANDLERS = {
     "setup_environment": handle_setup_environment,
     "clear_cache": handle_clear_cache,
     "parse_documents": handle_parse_documents,
-    "get_pending_image": handle_get_pending_image,
-    "submit_image_result": handle_submit_image_result,
     "get_workflow_state": handle_get_workflow_state,
     "get_doc_summary": handle_get_doc_summary,
     "get_doc_section": handle_get_doc_section,
