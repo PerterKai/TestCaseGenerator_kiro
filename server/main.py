@@ -222,8 +222,22 @@ def _is_low_info_image(img_data):
         if std_dev < 20 and unique_ratio < 0.15:
             return True
         # Also catch images where >95% of pixels are very light (>220)
+        # BUT exclude diagrams/flowcharts that have white backgrounds with
+        # meaningful structure (edges, lines, text boxes).
         light_count = sum(1 for p in pixels if p > 220)
         if light_count / n > 0.95:
+            # Before discarding, check for meaningful edge content.
+            # Diagrams on white backgrounds have sparse but clear edges.
+            from PIL import ImageFilter
+            edges = thumb.filter(ImageFilter.FIND_EDGES)
+            edge_pixels = list(edges.getdata())
+            # Count pixels with significant edge response (>30)
+            edge_active = sum(1 for p in edge_pixels if p > 30)
+            edge_ratio = edge_active / n
+            # If more than 3% of pixels have strong edges, it's a diagram,
+            # not a blank/decorative background — keep it.
+            if edge_ratio > 0.03:
+                return False
             return True
         return False
     except Exception:
@@ -700,7 +714,10 @@ def convert_docx_to_markdown(filepath):
                 continue
             text = para.text.strip()
             para_images = _find_images_in_element(para._element, rid_to_media)
-            if text:
+            # Check if this paragraph is an OLE Excel embed with hint text
+            _has_ole_embed = any(n in ole_preview_names for n in para_images) if para_images else False
+            # Skip "点击图片可查看完整电子表格" hint text attached to OLE embeds
+            if text and not (_has_ole_embed and '点击图片可查看完整电子表格' in text):
                 level = _detect_heading_level(para)
                 if level > 0:
                     md_lines.append("")
@@ -856,7 +873,9 @@ def _convert_docx_raw(filepath):
                         texts = [t.text for t in child.iter(f'{W}t') if t.text]
                         text = ''.join(texts).strip()
                         is_heading = False
-                        if text:
+                        para_images = _find_images_in_element(child, rid_to_media)
+                        _has_ole_embed = any(n in ole_preview_names for n in para_images) if para_images else False
+                        if text and not (_has_ole_embed and '点击图片可查看完整电子表格' in text):
                             pPr = child.find(f'{W}pPr')
                             if pPr is not None:
                                 pStyle = pPr.find(f'{W}pStyle')
@@ -872,7 +891,6 @@ def _convert_docx_raw(filepath):
                             if not is_heading:
                                 md_lines.append(text)
                                 md_lines.append("")
-                        para_images = _find_images_in_element(child, rid_to_media)
                         for img_name in para_images:
                             # Check if this is an OLE Excel preview image
                             if img_name in ole_preview_names:
