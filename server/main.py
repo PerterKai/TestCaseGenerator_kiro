@@ -161,6 +161,26 @@ def _reset_phase_state():
     return state
 
 # ============================================================
+# Document tagging constants
+# ============================================================
+# Tags in filename that mark a document as "primary" (用例生成目标)
+# Primary docs get full processing: text + images + test case generation
+# Other docs are "reference" (辅助资料): text only, consulted on demand
+PRIMARY_DOC_TAGS = ['【主prd】', '【主概设】', '【主后端概设】', '【主前端概设】']
+
+def _classify_document(filename):
+    """Classify a document as 'primary' or 'reference' based on filename tags.
+    
+    Returns ('primary', tag) if filename contains a primary tag, else ('reference', None).
+    If NO documents have primary tags, all are treated as primary (backward compat).
+    """
+    name_lower = filename.lower()
+    for tag in PRIMARY_DOC_TAGS:
+        if tag.lower() in name_lower:
+            return 'primary', tag
+    return 'reference', None
+
+# ============================================================
 # Image filtering constants
 # ============================================================
 # Only process images where: min(w,h) > 64 AND max(w,h) >= 224
@@ -1082,6 +1102,8 @@ def _build_doc_summary():
         sections = _parse_md_sections(content)
         doc_entry = {
             "name": md_info["name"],
+            "role": md_info.get("role", "primary"),
+            "tag": md_info.get("tag"),
             "total_chars": len(content),
             "sections": []
         }
@@ -1185,7 +1207,7 @@ TOOLS = [
     },
     {
         "name": "parse_documents",
-        "description": "Parse .docx files from doc/ directory: convert to markdown (.tmp/doc_mk/), extract images to .tmp/picture/. Returns file list and pending image count. State is persisted to .tmp/cache/ for cross-session resume. Will block if there's an in-progress workflow (pass force=true to override).",
+        "description": "Parse .docx files from doc/ directory: convert to markdown (.tmp/doc_mk/), extract images to .tmp/picture/. Returns file list and pending image count. State is persisted to .tmp/cache/ for cross-session resume. Will block if there's an in-progress workflow (pass force=true to override). 支持文档打标分类：文件名含【主prd】【主概设】【主后端概设】【主前端概设】的为主文档（提取图片+生成用例），其余为辅助资料（仅解析文字，按需查阅）。如果所有文档都没有标签，则全部视为主文档。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1210,7 +1232,7 @@ TOOLS = [
     },
     {
         "name": "get_doc_summary",
-        "description": "Get document structure summary (heading tree + char counts per section) without loading full content. Use this to plan which sections to read with get_doc_section.",
+        "description": "Get document structure summary (heading tree + char counts per section) without loading full content. Use this to plan which sections to read with get_doc_section. 文档按角色分类显示：📌主文档（用例生成目标）和📎辅助资料（按需查阅补充用例设计）。",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
@@ -1481,7 +1503,22 @@ def handle_parse_documents(args):
     all_pending_images = []
     content_parts = []
 
+    # Phase 1: Classify all documents
+    doc_classifications = []
     for fpath in files:
+        basename = os.path.basename(fpath)
+        role, tag = _classify_document(basename)
+        doc_classifications.append((fpath, role, tag))
+
+    # If no documents have primary tags, treat ALL as primary (backward compat)
+    has_any_primary = any(role == 'primary' for _, role, _ in doc_classifications)
+    if not has_any_primary:
+        doc_classifications = [(fp, 'primary', None) for fp, _, _ in doc_classifications]
+
+    primary_count = sum(1 for _, r, _ in doc_classifications if r == 'primary')
+    ref_count = sum(1 for _, r, _ in doc_classifications if r == 'reference')
+
+    for fpath, doc_role, doc_tag in doc_classifications:
         try:
             doc_name = os.path.splitext(os.path.basename(fpath))[0]
             md_text, image_registry, image_data_map = convert_docx_to_markdown(fpath)
@@ -1490,34 +1527,47 @@ def handle_parse_documents(args):
             md_path = os.path.join(TMP_DOC_DIR, md_filename)
             with open(md_path, 'w', encoding='utf-8') as f:
                 f.write(md_text)
-            all_md_files.append({"name": md_filename, "path": md_path})
-
-            skipped = 0
-            for img_id, (img_data, ext) in image_data_map.items():
-                resized_data, mime = _resize_image(img_data, ext)
-                out_ext = ".png" if "png" in mime else ".jpg"
-                img_filename = os.path.splitext(img_id)[0] + out_ext
-                img_path = os.path.join(TMP_PIC_DIR, img_filename)
-                # Store relative path for cross-workspace portability
-                img_rel_path = os.path.join(".tmp", "picture", img_filename)
-                with open(img_path, 'wb') as f:
-                    f.write(resized_data)
-                all_pending_images.append({
-                    "id": img_id, "filename": img_filename,
-                    "path": img_path, "rel_path": img_rel_path,
-                    "mime": mime, "size": len(img_data), "source_doc": doc_name,
-                    "processed": False
-                })
-
-            for orig_name, uid in image_registry.items():
-                if uid not in image_data_map:
-                    skipped += 1
-
-            content_parts.append({
-                "type": "text",
-                "text": (f"✓ {os.path.basename(fpath)} → {md_filename}\n"
-                         f"  图片: {len(image_data_map)} 张提取, {skipped} 张跳过(EMF/WMF/过小)")
+            all_md_files.append({
+                "name": md_filename, "path": md_path,
+                "role": doc_role, "tag": doc_tag
             })
+
+            # Only extract images for primary documents
+            if doc_role == 'primary':
+                skipped = 0
+                for img_id, (img_data, ext) in image_data_map.items():
+                    resized_data, mime = _resize_image(img_data, ext)
+                    out_ext = ".png" if "png" in mime else ".jpg"
+                    img_filename = os.path.splitext(img_id)[0] + out_ext
+                    img_path = os.path.join(TMP_PIC_DIR, img_filename)
+                    # Store relative path for cross-workspace portability
+                    img_rel_path = os.path.join(".tmp", "picture", img_filename)
+                    with open(img_path, 'wb') as f:
+                        f.write(resized_data)
+                    all_pending_images.append({
+                        "id": img_id, "filename": img_filename,
+                        "path": img_path, "rel_path": img_rel_path,
+                        "mime": mime, "size": len(img_data), "source_doc": doc_name,
+                        "processed": False
+                    })
+
+                for orig_name, uid in image_registry.items():
+                    if uid not in image_data_map:
+                        skipped += 1
+
+                role_label = f"[主文档{doc_tag or ''}]" if doc_tag else "[主文档]"
+                content_parts.append({
+                    "type": "text",
+                    "text": (f"✓ {role_label} {os.path.basename(fpath)} → {md_filename}\n"
+                             f"  图片: {len(image_data_map)} 张提取, {skipped} 张跳过(EMF/WMF/过小)")
+                })
+            else:
+                # Reference document: text only, no image processing
+                content_parts.append({
+                    "type": "text",
+                    "text": (f"✓ [辅助资料] {os.path.basename(fpath)} → {md_filename}\n"
+                             f"  仅解析文字内容，图片不处理（{len(image_data_map)} 张跳过）")
+                })
         except Exception as e:
             content_parts.append({"type": "text", "text": f"✗ Error parsing {fpath}: {e}"})
 
@@ -1533,9 +1583,12 @@ def handle_parse_documents(args):
 
     total_imgs = len(all_pending_images)
     summary = (f"\n转换完成:\n"
-               f"  Markdown 文件: {len(all_md_files)} 个 → {TMP_DOC_DIR}\n"
-               f"  图片文件: {total_imgs} 张 → {TMP_PIC_DIR}\n"
-               f"  缓存目录: {TMP_CACHE_DIR}\n")
+               f"  Markdown 文件: {len(all_md_files)} 个 → {TMP_DOC_DIR}\n")
+    if ref_count > 0:
+        summary += f"    主文档: {primary_count} 个（生成用例+处理图片）\n"
+        summary += f"    辅助资料: {ref_count} 个（仅文字，按需查阅）\n"
+    summary += (f"  图片文件: {total_imgs} 张 → {TMP_PIC_DIR}\n"
+                f"  缓存目录: {TMP_CACHE_DIR}\n")
     if total_imgs > 0:
         summary += ("\n图片处理：\n"
                     "  调用 configure_llm_api 配置外部多模态LLM API，然后调用 process_images_with_llm 批量处理\n"
@@ -1656,17 +1709,42 @@ def handle_get_doc_summary(args):
     summary = _build_doc_summary()
     lines = ["📄 文档结构概览:", ""]
 
+    primary_docs = []
+    ref_docs = []
     for doc in summary["documents"]:
-        lines.append(f"📁 {doc['name']} ({doc['total_chars']} 字符)")
-        for sec in doc["sections"]:
-            indent = "  " * sec["level"]
-            lines.append(f"{indent}{'#' * sec['level']} {sec['heading']} ({sec['char_count']} 字符)")
-        lines.append("")
+        role = doc.get("role", "primary")
+        if role == "primary":
+            primary_docs.append(doc)
+        else:
+            ref_docs.append(doc)
 
-    lines.append(f"总计: {len(summary['documents'])} 个文档, {summary['total_sections']} 个章节, {summary['total_chars']} 字符")
+    if primary_docs:
+        lines.append("📌 主文档（用例生成目标）:")
+        for doc in primary_docs:
+            tag = doc.get("tag") or ""
+            lines.append(f"  📁 {tag} {doc['name']} ({doc['total_chars']} 字符)")
+            for sec in doc["sections"]:
+                indent = "    " + "  " * sec["level"]
+                lines.append(f"{indent}{'#' * sec['level']} {sec['heading']} ({sec['char_count']} 字符)")
+            lines.append("")
+
+    if ref_docs:
+        lines.append("📎 辅助资料（按需查阅）:")
+        for doc in ref_docs:
+            lines.append(f"  📁 {doc['name']} ({doc['total_chars']} 字符)")
+            for sec in doc["sections"]:
+                indent = "    " + "  " * sec["level"]
+                lines.append(f"{indent}{'#' * sec['level']} {sec['heading']} ({sec['char_count']} 字符)")
+            lines.append("")
+
+    lines.append(f"总计: {len(summary['documents'])} 个文档 ({len(primary_docs)} 主文档 + {len(ref_docs)} 辅助资料), {summary['total_sections']} 个章节, {summary['total_chars']} 字符")
     lines.append("")
-    lines.append("请按模块调用 get_doc_section(doc_name, section_heading) 分段读取内容，")
-    lines.append("每读取一个模块就生成该模块的测试用例，避免一次性加载全部文档。")
+    if primary_docs:
+        lines.append("请优先按主文档的模块调用 get_doc_section(doc_name, section_heading) 分段读取内容，")
+        lines.append("每读取一个模块就生成该模块的测试用例。辅助资料在需要补充信息时按需查阅。")
+    else:
+        lines.append("请按模块调用 get_doc_section(doc_name, section_heading) 分段读取内容，")
+        lines.append("每读取一个模块就生成该模块的测试用例，避免一次性加载全部文档。")
 
     return {
         "content": [{"type": "text", "text": "\n".join(lines)}],
