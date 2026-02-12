@@ -173,6 +173,88 @@ def _should_process_image(w, h):
     long_ = max(w, h)
     return short > IMG_MIN_SHORT_EDGE and long_ >= IMG_MIN_LONG_EDGE
 
+
+def _is_low_info_image(img_data):
+    """Detect background/decorative images with very low information content.
+    
+    Filters out images that are nearly uniform in color (e.g. white/grey
+    background layers, watermark patterns, solid fills) by checking:
+    1. Grayscale standard deviation — low means nearly uniform color
+    2. Unique color ratio — low means very few distinct colors relative to pixels
+    """
+    try:
+        from PIL import Image
+        img = Image.open(BytesIO(img_data))
+        # Sample at reduced size for speed (64x64 is enough for statistics)
+        thumb = img.resize((64, 64), Image.LANCZOS).convert('L')
+        pixels = list(thumb.getdata())
+        n = len(pixels)
+        if n == 0:
+            return True
+        # Standard deviation of grayscale values
+        mean = sum(pixels) / n
+        variance = sum((p - mean) ** 2 for p in pixels) / n
+        std_dev = variance ** 0.5
+        # Unique color ratio (on thumbnail)
+        unique_ratio = len(set(pixels)) / 256.0  # out of 256 possible gray levels
+        # Very low std_dev means nearly uniform (background/solid fill)
+        # Threshold: std_dev < 20 AND fewer than 15% of gray levels used
+        if std_dev < 20 and unique_ratio < 0.15:
+            return True
+        # Also catch images where >95% of pixels are very light (>220)
+        light_count = sum(1 for p in pixels if p > 220)
+        if light_count / n > 0.95:
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_blurry_overview(img_data):
+    """Detect blurry overview/thumbnail images where text is unreadable.
+    
+    Uses Laplacian variance to measure edge sharpness. Overview screenshots
+    that show many tiny windows/panels shrunk to unreadable size will have
+    very low Laplacian variance because all detail is lost to scaling.
+    
+    Also checks the ratio of "dark background" pixels — overview images
+    from design tools often have large dark/black canvas areas.
+    """
+    try:
+        from PIL import Image, ImageFilter
+        img = Image.open(BytesIO(img_data))
+        w, h = img.size
+        # Only check images large enough to be overview screenshots
+        if w < 400 or h < 300:
+            return False
+        # Resize to standard analysis size (512px wide) for consistent thresholds
+        ratio = 512.0 / w
+        analyze_img = img.resize((512, int(h * ratio)), Image.LANCZOS).convert('L')
+        aw, ah = analyze_img.size
+        pixels = list(analyze_img.getdata())
+        n = len(pixels)
+        # Check 1: Large dark background ratio (>40% pixels very dark, <40)
+        # Overview images from design tools have big black/dark canvas
+        dark_count = sum(1 for p in pixels if p < 40)
+        dark_ratio = dark_count / n
+        # Check 2: Laplacian variance (edge sharpness)
+        # Apply Laplacian kernel via Pillow's FIND_EDGES
+        edges = analyze_img.filter(ImageFilter.FIND_EDGES)
+        edge_pixels = list(edges.getdata())
+        edge_mean = sum(edge_pixels) / len(edge_pixels)
+        edge_var = sum((p - edge_mean) ** 2 for p in edge_pixels) / len(edge_pixels)
+        # Overview/thumbnail images: lots of dark background + low edge detail
+        # Threshold: >40% dark background AND low edge variance (<800)
+        if dark_ratio > 0.40 and edge_var < 800:
+            return True
+        # Also catch extremely blurry images regardless of background
+        # (edge variance < 200 means almost no discernible detail)
+        if edge_var < 200:
+            return True
+        return False
+    except Exception:
+        return False
+
 # ============================================================
 # Image helpers
 # ============================================================
@@ -521,6 +603,8 @@ def convert_docx_to_markdown(filepath):
                             continue
                     except Exception:
                         continue
+                    if _is_low_info_image(img_data) or _is_blurry_overview(img_data):
+                        continue
                     img_id = _generate_image_id(doc_name, name)
                     image_registry[name] = img_id
                     image_data_map[img_id] = (img_data, ext)
@@ -560,6 +644,10 @@ def convert_docx_to_markdown(filepath):
                                 continue
                         except Exception:
                             pass
+                        # Skip low-information background/decorative/blurry images
+                        if _is_low_info_image(img_data) or _is_blurry_overview(img_data):
+                            skipped_ids.append(img_id)
+                            continue
                         image_data_map[img_id] = (img_data, ext)
                     else:
                         skipped_ids.append(img_id)
@@ -568,7 +656,7 @@ def convert_docx_to_markdown(filepath):
                 md_text = "\n".join(md_lines)
                 for sid in skipped_ids:
                     placeholder = f"{{{{IMG:{sid}}}}}"
-                    annotation = f"<!-- 已跳过小图标: {sid} -->"
+                    annotation = f"<!-- 已跳过(小图标/背景图): {sid} -->"
                     md_text = md_text.replace(placeholder, annotation)
                 md_lines = md_text.split("\n")
     except Exception:
@@ -664,6 +752,8 @@ def _convert_docx_raw(filepath):
                             continue
                     except Exception:
                         continue
+                    if _is_low_info_image(img_data) or _is_blurry_overview(img_data):
+                        continue
                     img_id = _generate_image_id(doc_name, name)
                     image_registry[name] = img_id
                     image_data_map[img_id] = (img_data, ext)
@@ -702,6 +792,10 @@ def _convert_docx_raw(filepath):
                                 continue
                         except Exception:
                             pass
+                        # Skip low-information background/decorative/blurry images
+                        if _is_low_info_image(img_data) or _is_blurry_overview(img_data):
+                            skipped_ids.append(img_id)
+                            continue
                         image_data_map[img_id] = (img_data, ext)
                     else:
                         skipped_ids.append(img_id)
@@ -710,7 +804,7 @@ def _convert_docx_raw(filepath):
                 md_text = "\n".join(md_lines)
                 for sid in skipped_ids:
                     placeholder = f"{{{{IMG:{sid}}}}}"
-                    annotation = f"<!-- 已跳过小图标: {sid} -->"
+                    annotation = f"<!-- 已跳过(小图标/背景图): {sid} -->"
                     md_text = md_text.replace(placeholder, annotation)
                 md_lines = md_text.split("\n")
     except Exception as e:
