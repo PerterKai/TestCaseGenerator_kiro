@@ -1090,7 +1090,10 @@ def create_xmind_file(modules, output_path):
                     inner = topic(f"预期结果: {c['expected_result']}")
                 steps = c.get("steps", [])
                 if steps:
-                    steps_text = "\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1))
+                    if isinstance(steps, str):
+                        steps_text = steps
+                    else:
+                        steps_text = "\n".join(f"{i}. {step}" for i, step in enumerate(steps, 1))
                     inner = topic(f"执行步骤:\n{steps_text}", [inner] if inner else None)
                 if c.get("preconditions"):
                     inner = topic(f"前置条件: {c['preconditions']}", [inner] if inner else None)
