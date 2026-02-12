@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Test Case Generator MCP Server v6.0
+Test Case Generator MCP Server v7.0
 - Phase-based workflow with file cache for cross-session resume
 - Splits document reading into summary + sections to reduce context
-- Session switch hints when image batch threshold reached
+- External multimodal LLM API support with GUI configuration
+- Multi-threaded image processing
+- Improved image extraction (VML, OLE, orphan detection)
 - All state persisted to .tmp/cache/ for recovery
 """
 
@@ -17,6 +19,7 @@ import subprocess
 import base64
 import hashlib
 import shutil
+import threading
 from io import BytesIO
 from xml.etree import ElementTree as ET
 
@@ -158,6 +161,19 @@ def _reset_phase_state():
     return state
 
 # ============================================================
+# Image filtering constants
+# ============================================================
+# Only process images where: min(w,h) > 64 AND max(w,h) >= 224
+IMG_MIN_SHORT_EDGE = 64   # shortest side must be > this
+IMG_MIN_LONG_EDGE = 224   # longest side must be >= this
+
+def _should_process_image(w, h):
+    """Return True if image dimensions qualify for analysis."""
+    short = min(w, h)
+    long_ = max(w, h)
+    return short > IMG_MIN_SHORT_EDGE and long_ >= IMG_MIN_LONG_EDGE
+
+# ============================================================
 # Image helpers
 # ============================================================
 
@@ -183,8 +199,8 @@ def _resize_image(img_data, ext):
         img_obj = Image.open(BytesIO(img_data))
         w, h = img_obj.size
 
-        # Skip tiny images (icons, decorations) - no analysis value
-        if w < 60 or h < 60:
+        # Skip images that don't meet dimension threshold
+        if not _should_process_image(w, h):
             return final_data, final_mime
 
         # Resize large images, scale based on content density
@@ -220,14 +236,45 @@ def _build_rid_to_media(filepath):
     rid_to_media = {}
     try:
         with zipfile.ZipFile(filepath, 'r') as z:
-            rels_path = 'word/_rels/document.xml.rels'
-            if rels_path in z.namelist():
-                rels_root = ET.fromstring(z.read(rels_path))
-                for rel in rels_root:
-                    target = rel.get('Target', '')
-                    rid = rel.get('Id', '')
-                    if 'media/' in target:
-                        rid_to_media[rid] = target.split('/')[-1]
+            # Collect all actual media files in the zip for cross-reference
+            actual_media = set()
+            for name in z.namelist():
+                if name.startswith('word/media/'):
+                    actual_media.add(os.path.basename(name))
+
+            # Parse all .rels files under word/ (document, headers, footers, etc.)
+            rels_files = [n for n in z.namelist()
+                          if n.startswith('word/') and n.endswith('.rels')]
+            for rels_path in rels_files:
+                try:
+                    rels_root = ET.fromstring(z.read(rels_path))
+                    for rel in rels_root:
+                        target = rel.get('Target', '')
+                        rid = rel.get('Id', '')
+                        rel_type = rel.get('Type', '')
+                        # Match media/ in target path (handles media/xxx and ../media/xxx)
+                        if 'media/' in target:
+                            rid_to_media[rid] = target.split('/')[-1]
+                        # Also match image relationship types without media/ in path
+                        elif 'image' in rel_type.lower():
+                            basename = target.split('/')[-1]
+                            if basename in actual_media:
+                                rid_to_media[rid] = basename
+                        # OLE object images
+                        elif 'oleObject' in rel_type or 'package' in rel_type.lower():
+                            basename = target.split('/')[-1]
+                            if basename in actual_media:
+                                rid_to_media[rid] = basename
+                except Exception:
+                    continue
+
+            # Ensure all media files are discoverable: create reverse mapping
+            # for any media file not yet referenced by a relationship
+            referenced_media = set(rid_to_media.values())
+            unreferenced = actual_media - referenced_media
+            if unreferenced:
+                sys.stderr.write(f"[MCP] Found {len(unreferenced)} unreferenced media files: {unreferenced}\n")
+                sys.stderr.flush()
     except Exception:
         pass
     return rid_to_media
@@ -237,24 +284,53 @@ def _find_images_in_element(elem, rid_to_media):
     A_NS = 'http://schemas.openxmlformats.org/drawingml/2006/main'
     R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
     W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    V_NS = 'urn:schemas-microsoft-com:vml'
+    O_NS = 'urn:schemas-microsoft-com:office:office'
     found = []
     seen = set()
-    for blip in elem.iter(f'{{{A_NS}}}blip'):
-        rid = blip.get(f'{{{R_NS}}}embed', '')
+
+    def _add(rid):
         if rid and rid in rid_to_media:
             name = rid_to_media[rid]
             if name not in seen:
                 seen.add(name)
                 found.append(name)
+
+    # 1. DrawingML blip (standard images)
+    for blip in elem.iter(f'{{{A_NS}}}blip'):
+        _add(blip.get(f'{{{R_NS}}}embed', ''))
+        _add(blip.get(f'{{{R_NS}}}link', ''))
+
+    # 2. VML w:pict > v:imagedata (legacy images)
     for pict in elem.iter(f'{{{W_NS}}}pict'):
         for child in pict.iter():
-            rid = child.get(f'{{{R_NS}}}id', '')
-            if rid and rid in rid_to_media:
-                name = rid_to_media[rid]
+            _add(child.get(f'{{{R_NS}}}id', ''))
+            _add(child.get(f'{{{R_NS}}}href', ''))
+            _add(child.get(f'{{{R_NS}}}pict', ''))
+
+    # 3. VML v:imagedata directly (some docs use VML namespace)
+    for imgdata in elem.iter(f'{{{V_NS}}}imagedata'):
+        _add(imgdata.get(f'{{{R_NS}}}id', ''))
+        _add(imgdata.get(f'{{{R_NS}}}href', ''))
+        for attr_name, attr_val in imgdata.attrib.items():
+            if attr_name.endswith('}id') or attr_name.endswith('}href'):
+                _add(attr_val)
+
+    # 4. OLE objects with image representations
+    for ole in elem.iter(f'{{{O_NS}}}OLEObject'):
+        _add(ole.get(f'{{{R_NS}}}id', ''))
+
+    # 5. Fallback: scan all elements for r:embed / r:id pointing to media
+    for child in elem.iter():
+        for attr_name, attr_val in child.attrib.items():
+            if ('embed' in attr_name.lower() or attr_name.endswith('}id')) and attr_val in rid_to_media:
+                name = rid_to_media[attr_val]
                 if name not in seen:
                     seen.add(name)
                     found.append(name)
+
     return found
+
 
 
 def _detect_heading_level(para):
@@ -424,19 +500,62 @@ def convert_docx_to_markdown(filepath):
         with zipfile.ZipFile(filepath, 'r') as z:
             media = [n for n in z.namelist() if n.startswith('word/media/')]
             skipped_ids = []
+
+            # Also detect orphan images (in zip but not referenced by any paragraph/table)
+            referenced_names = set(image_registry.keys())
+            for img_path in media:
+                name = os.path.basename(img_path)
+                if name not in referenced_names:
+                    # Orphan image: add to registry and markdown
+                    ext = os.path.splitext(name)[1].lstrip('.')
+                    if ext.lower() in ('emf', 'wmf'):
+                        continue  # Skip vector-only orphans
+                    img_data = z.read(img_path)
+                    if len(img_data) < 500:
+                        continue
+                    try:
+                        from PIL import Image as _Img
+                        _tmp = _Img.open(BytesIO(img_data))
+                        _w, _h = _tmp.size
+                        if not _should_process_image(_w, _h):
+                            continue
+                    except Exception:
+                        continue
+                    img_id = _generate_image_id(doc_name, name)
+                    image_registry[name] = img_id
+                    image_data_map[img_id] = (img_data, ext)
+                    md_lines.append(f"{{{{IMG:{img_id}}}}}")
+                    md_lines.append("")
+
             for img_path in media:
                 name = os.path.basename(img_path)
                 if name in image_registry:
                     img_id = image_registry[name]
+                    if img_id in image_data_map:
+                        continue  # Already processed as orphan
                     ext = os.path.splitext(name)[1].lstrip('.')
                     img_data = z.read(img_path)
-                    if len(img_data) >= 500 and ext.lower() not in ('emf', 'wmf'):
-                        # Skip tiny images by pixel dimensions (icons/decorations)
+
+                    # Try to convert EMF/WMF to PNG via Pillow
+                    if ext.lower() in ('emf', 'wmf'):
+                        try:
+                            from PIL import Image as _Img
+                            _tmp = _Img.open(BytesIO(img_data))
+                            buf = BytesIO()
+                            _tmp.save(buf, format='PNG')
+                            img_data = buf.getvalue()
+                            ext = 'png'
+                        except Exception:
+                            skipped_ids.append(img_id)
+                            continue
+
+                    if len(img_data) >= 500:
+                        # Skip images that don't meet dimension threshold
                         try:
                             from PIL import Image as _Img
                             _tmp = _Img.open(BytesIO(img_data))
                             _w, _h = _tmp.size
-                            if _w < 60 or _h < 60:
+                            if not _should_process_image(_w, _h):
                                 skipped_ids.append(img_id)
                                 continue
                         except Exception:
@@ -525,18 +644,60 @@ def _convert_docx_raw(filepath):
                             md_lines.append("")
             media = [n for n in z.namelist() if n.startswith('word/media/')]
             skipped_ids = []
+
+            # Detect orphan images (in zip but not referenced by any element)
+            referenced_names = set(image_registry.keys())
+            for img_path in media:
+                name = os.path.basename(img_path)
+                if name not in referenced_names:
+                    ext = os.path.splitext(name)[1].lstrip('.')
+                    if ext.lower() in ('emf', 'wmf'):
+                        continue
+                    img_data = z.read(img_path)
+                    if len(img_data) < 500:
+                        continue
+                    try:
+                        from PIL import Image as _Img
+                        _tmp = _Img.open(BytesIO(img_data))
+                        _w, _h = _tmp.size
+                        if not _should_process_image(_w, _h):
+                            continue
+                    except Exception:
+                        continue
+                    img_id = _generate_image_id(doc_name, name)
+                    image_registry[name] = img_id
+                    image_data_map[img_id] = (img_data, ext)
+                    md_lines.append(f"{{{{IMG:{img_id}}}}}")
+                    md_lines.append("")
+
             for img_path in media:
                 name = os.path.basename(img_path)
                 if name in image_registry:
                     img_id = image_registry[name]
+                    if img_id in image_data_map:
+                        continue
                     ext = os.path.splitext(name)[1].lstrip('.')
                     img_data = z.read(img_path)
-                    if len(img_data) >= 500 and ext.lower() not in ('emf', 'wmf'):
+
+                    # Try to convert EMF/WMF to PNG
+                    if ext.lower() in ('emf', 'wmf'):
+                        try:
+                            from PIL import Image as _Img
+                            _tmp = _Img.open(BytesIO(img_data))
+                            buf = BytesIO()
+                            _tmp.save(buf, format='PNG')
+                            img_data = buf.getvalue()
+                            ext = 'png'
+                        except Exception:
+                            skipped_ids.append(img_id)
+                            continue
+
+                    if len(img_data) >= 500:
                         try:
                             from PIL import Image as _Img
                             _tmp = _Img.open(BytesIO(img_data))
                             _w, _h = _tmp.size
-                            if _w < 60 or _h < 60:
+                            if not _should_process_image(_w, _h):
                                 skipped_ids.append(img_id)
                                 continue
                         except Exception:
@@ -869,6 +1030,22 @@ TOOLS = [
             },
             "required": []
         }
+    },
+    {
+        "name": "configure_llm_api",
+        "description": "打开GUI窗口配置外部多模态LLM API，用于图片解析。支持配置API地址、API Key、测试连接、获取模型列表、选择模型、多线程设置。配置会自动保存，下次打开时恢复上次输入。用户选择'图片+文本解析'模式时调用此工具。",
+        "inputSchema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "process_images_with_llm",
+        "description": "使用已配置的外部多模态LLM API批量处理所有待处理图片。支持多线程并发。需先调用configure_llm_api配置API。处理完成后自动将分析结果回填到Markdown文档对应位置。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "force_reprocess": {"type": "boolean", "description": "强制重新处理已处理的图片 (default: false)"}
+            },
+            "required": []
+        }
     }
 ]
 
@@ -1111,9 +1288,10 @@ def handle_parse_documents(args):
                f"  图片文件: {total_imgs} 张 → {TMP_PIC_DIR}\n"
                f"  缓存目录: {TMP_CACHE_DIR}\n")
     if total_imgs > 0:
-        summary += (f"\n请逐一调用 get_pending_image 获取待处理图片，\n"
-                    f"用视觉能力分析后调用 submit_image_result 提交结果。\n"
-                    f"全部处理完成后调用 get_doc_summary 获取文档结构概览。")
+        summary += ("\n图片处理方式（二选一）：\n"
+                    "  方式A（推荐）: 调用 configure_llm_api 配置外部LLM，然后调用 process_images_with_llm 批量处理\n"
+                    "  方式B: 逐一调用 get_pending_image 获取图片，用视觉能力分析后调用 submit_image_result 提交结果\n"
+                    "全部处理完成后调用 get_doc_summary 获取文档结构概览。")
     else:
         summary += "\n无需处理图片，可直接调用 get_doc_summary 获取文档结构概览。"
 
@@ -1187,6 +1365,8 @@ def handle_get_pending_image(args):
     processed = sum(1 for p in pending if p["processed"])
     remaining = total - processed - 1
 
+    mime = next_img["mime"]
+
     text_info = (
         f"[{processed + 1}/{total}] 图片ID: {next_img['id']}\n"
         f"图片文件: {rel_path}\n\n"
@@ -1194,9 +1374,13 @@ def handle_get_pending_image(args):
         f"分析完成后调用 submit_image_result(image_id=\"{next_img['id']}\", analysis=\"你的分析结果\")"
     )
 
+    # Return image via MCP image content (spec-compliant).
+    # If the MCP client does not relay image content to the agent's multimodal
+    # input, the agent should ask the user to drag the image file into chat
+    # using the relative path provided in text_info and image_path field.
     content_parts = [
         {"type": "text", "text": text_info},
-        {"type": "image", "data": b64, "mimeType": next_img["mime"]}
+        {"type": "image", "data": b64, "mimeType": mime}
     ]
 
     result = {
@@ -1208,9 +1392,6 @@ def handle_get_pending_image(args):
         "remaining": remaining + 1,
     }
 
-    # Always show remaining count; no forced session switch.
-    # Cross-session resume is still supported — if the system triggers a new
-    # session, calling get_workflow_state will pick up right where it left off.
     if remaining > 0:
         content_parts.append({"type": "text", "text": f"提交后还剩 {remaining} 张待处理。"})
 
@@ -1360,10 +1541,11 @@ def handle_get_workflow_state(args):
     has_testcases = total_cases > 0
 
     if has_unprocessed_images:
-        lines.append(f"▶ 继续操作: 调用 get_pending_image 处理剩余 {unprocessed_imgs} 张图片")
+        lines.append(f"▶ 继续操作: 有 {unprocessed_imgs} 张图片待处理，可选择：")
+        lines.append(f"  - 调用 configure_llm_api + process_images_with_llm 使用外部LLM批量处理（推荐）")
+        lines.append(f"  - 调用 get_pending_image 使用内置视觉逐一处理")
     elif not img_completed and total_imgs > 0:
-        # Images exist but status not marked completed yet
-        lines.append("▶ 继续操作: 调用 get_pending_image 检查图片处理状态")
+        lines.append("▶ 继续操作: 调用 get_pending_image 或 process_images_with_llm 检查图片处理状态")
     elif (img_completed or total_imgs == 0) and not has_testcases:
         lines.append("▶ 继续操作: 调用 get_doc_summary 获取文档结构，然后按模块生成测试用例")
     elif has_testcases and export_status != "completed":
@@ -1669,7 +1851,6 @@ def handle_review_module_structure(args):
         stats.append(f"  📦 {m['name']}: {len(m.get('sub_modules', []))} 子模块, {total} 用例")
 
     if module_sizes:
-        sizes = [s for _, s in module_sizes]
         max_name, max_size = max(module_sizes, key=lambda x: x[1])
         min_name, min_size = min(module_sizes, key=lambda x: x[1])
 
@@ -1912,6 +2093,245 @@ def handle_export_xmind(args):
         return {"content": [{"type": "text", "text": f"Export failed: {e}"}]}
 
 # ============================================================
+# ============================================================
+# External LLM Image Processing Handlers
+# ============================================================
+
+def _get_gui_module_path():
+    """Get the path to gui_llm_config.py relative to this file."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_llm_config.py")
+
+
+def handle_configure_llm_api(args):
+    """Launch GUI for configuring external LLM API. Runs as subprocess to avoid blocking MCP."""
+    workspace = _workspace()
+    gui_path = _get_gui_module_path()
+
+    if not os.path.exists(gui_path):
+        return {"content": [{"type": "text", "text": f"错误: GUI 模块未找到: {gui_path}"}]}
+
+    try:
+        # Run GUI as subprocess so it doesn't block the MCP server
+        result = subprocess.run(
+            [sys.executable, gui_path, workspace],
+            capture_output=True, text=True, timeout=300,
+            encoding='utf-8', errors='replace'
+        )
+        if result.returncode == 0:
+            # Parse the config from stdout
+            try:
+                config = json.loads(result.stdout.strip())
+                msg_lines = [
+                    "✓ LLM API 配置已保存:",
+                    f"  API 地址: {config.get('api_url', '')}",
+                    f"  API Key: {'已设置' if config.get('api_key') else '未设置'}",
+                    f"  模型: {config.get('model', '')}",
+                    f"  多线程: {'启用 (' + str(config.get('max_threads', 3)) + ' 线程)' if config.get('enable_multithreading') else '禁用'}",
+                    "",
+                    "配置完成，可以调用 process_images_with_llm 开始处理图片。"
+                ]
+                return {"content": [{"type": "text", "text": "\n".join(msg_lines)}], "config": config}
+            except json.JSONDecodeError:
+                return {"content": [{"type": "text", "text": f"GUI 输出解析失败: {result.stdout[:500]}"}]}
+        else:
+            if "Cancelled" in (result.stdout or ""):
+                return {"content": [{"type": "text", "text": "用户取消了配置。"}]}
+            return {"content": [{"type": "text", "text": f"GUI 配置失败 (exit {result.returncode}): {result.stderr[:500]}"}]}
+    except subprocess.TimeoutExpired:
+        return {"content": [{"type": "text", "text": "配置窗口超时（5分钟），请重新调用 configure_llm_api。"}]}
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"启动配置窗口失败: {e}"}]}
+
+
+def _process_single_image(img_info, api_url, api_key, model, prompt):
+    """Process a single image with external LLM. Returns (img_id, success, result_text)."""
+    img_id = img_info["id"]
+    img_file_path = img_info["path"]
+    rel_path = img_info.get("rel_path", os.path.join(".tmp", "picture", img_info["filename"]))
+
+    # Resolve path
+    if not os.path.exists(img_file_path):
+        img_file_path = os.path.join(_workspace(), rel_path)
+    if not os.path.exists(img_file_path):
+        img_file_path = os.path.join(TMP_PIC_DIR, img_info["filename"])
+
+    if not os.path.exists(img_file_path):
+        return img_id, False, f"图片文件不存在: {img_file_path}"
+
+    try:
+        with open(img_file_path, 'rb') as f:
+            img_data = f.read()
+        b64 = base64.b64encode(img_data).decode('ascii')
+        mime = img_info.get("mime", "image/png")
+
+        # Import from gui module
+        gui_dir = os.path.dirname(os.path.abspath(__file__))
+        if gui_dir not in sys.path:
+            sys.path.insert(0, gui_dir)
+        from gui_llm_config import call_llm_vision
+
+        ok, result = call_llm_vision(api_url, api_key, model, b64, mime, prompt, timeout=120)
+        return img_id, ok, result
+    except Exception as e:
+        return img_id, False, f"处理异常: {e}"
+
+
+# Lock for thread-safe markdown file writes (used by multi-threaded LLM processing)
+_md_write_lock = threading.Lock()
+
+
+def _write_image_result_to_md(img_info, analysis):
+    """Write image analysis result back to markdown file. Thread-safe."""
+    source_doc = img_info["source_doc"]
+    img_id = img_info["id"]
+    md_path = os.path.join(TMP_DOC_DIR, f"{source_doc}.md")
+
+    if not os.path.exists(md_path):
+        return False, f"Markdown 文件不存在: {md_path}"
+
+    placeholder = f"{{{{IMG:{img_id}}}}}"
+    replacement = f"<!-- 图片分析: {img_info['filename']} -->\n{analysis}\n<!-- /图片分析 -->"
+
+    try:
+        with _md_write_lock:
+            with open(md_path, 'r', encoding='utf-8') as f:
+                md_content = f.read()
+
+            if placeholder in md_content:
+                md_content = md_content.replace(placeholder, replacement)
+                with open(md_path, 'w', encoding='utf-8') as f:
+                    f.write(md_content)
+                return True, "OK"
+
+            # Try alternate extensions
+            base_id = os.path.splitext(img_id)[0]
+            for ext_try in [".png", ".jpg", ".jpeg"]:
+                alt_placeholder = f"{{{{IMG:{base_id}{ext_try}}}}}"
+                if alt_placeholder in md_content:
+                    md_content = md_content.replace(alt_placeholder, replacement)
+                    with open(md_path, 'w', encoding='utf-8') as f:
+                        f.write(md_content)
+                    return True, "OK"
+
+        return True, "占位符未找到，已标记为已处理"
+    except Exception as e:
+        return False, f"写入失败: {e}"
+
+
+
+def handle_process_images_with_llm(args):
+    """Process all pending images using configured external LLM API."""
+    force_reprocess = args.get("force_reprocess", False)
+
+    # Load LLM config
+    gui_dir = os.path.dirname(os.path.abspath(__file__))
+    if gui_dir not in sys.path:
+        sys.path.insert(0, gui_dir)
+    from gui_llm_config import load_config as load_llm_config
+
+    config = load_llm_config(_workspace())
+    api_url = config.get("api_url", "")
+    api_key = config.get("api_key", "")
+    model = config.get("model", "")
+    enable_mt = config.get("enable_multithreading", False)
+    max_threads = config.get("max_threads", 3)
+
+    if not api_url or not model:
+        return {"content": [{"type": "text", "text": (
+            "未配置外部 LLM API。请先调用 configure_llm_api 打开配置窗口。"
+        )}]}
+
+    # Get pending images
+    pending = testcase_store.get("pending_images", [])
+    if not pending:
+        _restore_store_from_cache()
+        pending = testcase_store.get("pending_images", [])
+    if not pending:
+        return {"content": [{"type": "text", "text": "没有待处理的图片。请先调用 parse_documents 解析文档。"}]}
+
+    # Filter to unprocessed images (or all if force_reprocess)
+    to_process = [img for img in pending if not img["processed"] or force_reprocess]
+    if not to_process:
+        return {"content": [{"type": "text", "text": "所有图片已处理完毕。如需重新处理，请传入 force_reprocess=true。"}]}
+
+    prompt = IMAGE_ANALYSIS_PROMPT
+    results_log = []
+    success_count = 0
+    fail_count = 0
+
+    if enable_mt and len(to_process) > 1:
+        # Multi-threaded processing
+        import concurrent.futures
+        actual_threads = min(max_threads, len(to_process))
+        results_log.append(f"🚀 多线程模式: {actual_threads} 线程并发处理 {len(to_process)} 张图片\n")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=actual_threads) as executor:
+            future_to_img = {}
+            for img in to_process:
+                future = executor.submit(_process_single_image, img, api_url, api_key, model, prompt)
+                future_to_img[future] = img
+
+            for future in concurrent.futures.as_completed(future_to_img):
+                img = future_to_img[future]
+                try:
+                    img_id, ok, result_text = future.result()
+                    if ok:
+                        wrote_ok, write_msg = _write_image_result_to_md(img, result_text)
+                        img["processed"] = True
+                        success_count += 1
+                        if not wrote_ok:
+                            results_log.append(f"  ⚠ [{img_id}] LLM成功但写入失败: {write_msg}")
+                        else:
+                            results_log.append(f"  ✓ [{img_id}] 处理成功")
+                    else:
+                        fail_count += 1
+                        results_log.append(f"  ✗ [{img_id}] {result_text[:200]}")
+                except Exception as e:
+                    fail_count += 1
+                    results_log.append(f"  ✗ [{img['id']}] 异常: {e}")
+    else:
+        # Sequential processing
+        results_log.append(f"📝 顺序处理 {len(to_process)} 张图片\n")
+        for i, img in enumerate(to_process, 1):
+            results_log.append(f"  [{i}/{len(to_process)}] 处理 {img['id']} ...")
+            img_id, ok, result_text = _process_single_image(img, api_url, api_key, model, prompt)
+            if ok:
+                wrote_ok, write_msg = _write_image_result_to_md(img, result_text)
+                img["processed"] = True
+                success_count += 1
+                if not wrote_ok:
+                    results_log.append(f"    ⚠ LLM成功但写入失败: {write_msg}")
+                else:
+                    results_log.append(f"    ✓ 成功")
+            else:
+                fail_count += 1
+                results_log.append(f"    ✗ {result_text[:200]}")
+
+    # Persist progress
+    _sync_store_to_cache()
+    total = len(pending)
+    processed = sum(1 for p in pending if p["processed"])
+    _save_phase_state("image_analysis", "completed" if processed == total else "in_progress", {
+        "total": total,
+        "processed": processed,
+    })
+
+    results_log.append(f"\n处理完成: {success_count} 成功, {fail_count} 失败, 总进度 {processed}/{total}")
+    if processed == total:
+        results_log.append("\n所有图片已处理完毕！请调用 get_doc_summary 获取文档结构概览。")
+    elif fail_count > 0:
+        results_log.append("\n部分图片处理失败，可以重新调用 process_images_with_llm 重试。")
+
+    return {
+        "content": [{"type": "text", "text": "\n".join(results_log)}],
+        "success_count": success_count,
+        "fail_count": fail_count,
+        "total_processed": processed,
+        "total_images": total,
+    }
+
+
+# ============================================================
 # MCP Main Loop
 # ============================================================
 
@@ -1930,6 +2350,8 @@ HANDLERS = {
     "export_xmind": handle_export_xmind,
     "review_module_structure": handle_review_module_structure,
     "export_report": handle_export_report,
+    "configure_llm_api": handle_configure_llm_api,
+    "process_images_with_llm": handle_process_images_with_llm,
 }
 
 
@@ -1945,7 +2367,7 @@ def handle_request(req):
         send_response(rid, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "testcase-generator", "version": "6.0.0"}
+            "serverInfo": {"name": "testcase-generator", "version": "7.0.0"}
         })
     elif method == "notifications/initialized":
         pass
@@ -1974,7 +2396,7 @@ def handle_request(req):
 
 
 def main():
-    sys.stderr.write("TestCase Generator MCP Server v6.0 starting...\n")
+    sys.stderr.write("TestCase Generator MCP Server v7.0 starting...\n")
     sys.stderr.flush()
 
     while True:
