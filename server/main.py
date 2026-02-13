@@ -2685,4 +2685,13 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Pre-import heavy modules BEFORE entering asyncio event loop.
+    # openpyxl's deep import chain can deadlock when first imported
+    # inside MCP stdio's async context. Importing here (synchronously,
+    # before stdio streams are set up) avoids the issue entirely.
+    for _mod in ("openpyxl", "docx", "PIL"):
+        try:
+            __import__(_mod)
+        except ImportError:
+            pass  # will be handled by _ensure_pkg later
     asyncio.run(main())
