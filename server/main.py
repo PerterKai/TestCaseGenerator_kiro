@@ -36,33 +36,41 @@ sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 # Auto-install helper
 # ============================================================
 
-def _ensure_pkg(import_name, pip_name):
+def _check_pkg_installed(pip_name):
+    """Check if a package is installed without importing it (avoids blocking on heavy imports)."""
     try:
-        __import__(import_name)
-        sys.stderr.write(f"[setup] _ensure_pkg: {import_name} already installed\n")
-        sys.stderr.flush()
+        from importlib.metadata import distribution
+        distribution(pip_name)
         return True
-    except ImportError:
-        sys.stderr.write(f"[setup] _ensure_pkg: {import_name} not found, installing {pip_name}...\n")
+    except Exception:
+        return False
+
+
+def _ensure_pkg(import_name, pip_name):
+    """Install a package if not present. Avoids __import__ to prevent deadlock in MCP stdio."""
+    if _check_pkg_installed(pip_name):
+        return True
+    sys.stderr.write(f"[setup] _ensure_pkg: installing {pip_name}...\n")
+    sys.stderr.flush()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", pip_name, "-q"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE, timeout=60)
+        ok = result.returncode == 0
+        sys.stderr.write(f"[setup] _ensure_pkg: pip install {pip_name} rc={result.returncode}\n")
+        if result.stderr:
+            sys.stderr.write(f"[setup] _ensure_pkg: pip stderr: {result.stderr[:500]}\n")
         sys.stderr.flush()
-        try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", pip_name, "-q"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE, timeout=60)
-            sys.stderr.write(f"[setup] _ensure_pkg: pip install {pip_name} finished, returncode={result.returncode}\n")
-            if result.stderr:
-                sys.stderr.write(f"[setup] _ensure_pkg: pip stderr: {result.stderr[:500]}\n")
-            sys.stderr.flush()
-            return True
-        except subprocess.TimeoutExpired:
-            sys.stderr.write(f"[setup] _ensure_pkg: pip install {pip_name} TIMEOUT (60s)\n")
-            sys.stderr.flush()
-            return False
-        except Exception as e:
-            sys.stderr.write(f"[setup] _ensure_pkg: pip install {pip_name} EXCEPTION: {e}\n")
-            sys.stderr.flush()
-            return False
+        return ok
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(f"[setup] _ensure_pkg: pip install {pip_name} TIMEOUT (60s)\n")
+        sys.stderr.flush()
+        return False
+    except Exception as e:
+        sys.stderr.write(f"[setup] _ensure_pkg: pip install {pip_name} EXCEPTION: {e}\n")
+        sys.stderr.flush()
+        return False
 
 # ============================================================
 # MCP Server Instance
@@ -1318,16 +1326,6 @@ TOOLS = [
 # ============================================================
 # Tool Handlers
 # ============================================================
-
-
-def _check_pkg_installed(pip_name):
-    """Check if a package is installed without importing it (avoids blocking on heavy imports)."""
-    try:
-        from importlib.metadata import distribution
-        distribution(pip_name)
-        return True
-    except Exception:
-        return False
 
 
 def handle_setup_environment(args):
