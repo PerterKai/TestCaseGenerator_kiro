@@ -3,8 +3,7 @@
     "testcase-generator": {
       "command": "python",
       "args": [
-        "-c",
-        "import os,sys\nhome=os.path.expanduser('~')\nrepos=os.path.join(home,'.kiro','powers','repos')\nscript=None\nif os.path.isdir(repos):\n for d in os.listdir(repos):\n  pm=os.path.join(repos,d,'POWER.md')\n  sm=os.path.join(repos,d,'server','main.py')\n  if os.path.isfile(pm) and os.path.isfile(sm):\n   with open(pm,encoding='utf-8') as f:\n    h=f.read(512)\n   if 'test-case-generator' in h:\n    script=sm\n    break\nif not script:\n cwd_sm=os.path.join(os.getcwd(),'server','main.py')\n if os.path.isfile(cwd_sm):\n  script=cwd_sm\nassert script,'test-case-generator power not found in repos or cwd'\nsys.argv=['main.py','--workspace',os.getcwd()]\nexec(compile(open(script,encoding='utf-8').read(),script,'exec'),{'__name__':'__main__','__file__':script})"
+        "server/main.py"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8"

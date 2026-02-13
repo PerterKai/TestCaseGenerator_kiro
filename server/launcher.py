@@ -53,8 +53,15 @@ def main():
     sys.stderr.write(f"[Launcher] Found server: {script}\n")
     sys.stderr.flush()
 
+    # Parse --workspace from command line args, fallback to cwd
+    workspace = os.getcwd()
+    for i, arg in enumerate(sys.argv):
+        if arg == "--workspace" and i + 1 < len(sys.argv):
+            workspace = sys.argv[i + 1]
+            break
+
     # Set up sys.argv for main.py
-    sys.argv = ["main.py", "--workspace", os.getcwd()]
+    sys.argv = ["main.py", "--workspace", workspace]
 
     # Execute main.py in its own context
     with open(script, encoding="utf-8") as f:

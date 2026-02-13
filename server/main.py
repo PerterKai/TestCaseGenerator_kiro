@@ -21,16 +21,14 @@ import hashlib
 import shutil
 import threading
 import traceback
+import asyncio
 from io import BytesIO
 from xml.etree import ElementTree as ET
 
-# ============================================================
-# Windows binary mode for stdin/stdout
-# ============================================================
-if sys.platform == "win32":
-    import msvcrt
-    msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
-    msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+# MCP SDK imports
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import Tool, TextContent
 
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
@@ -52,25 +50,9 @@ def _ensure_pkg(import_name, pip_name):
             return False
 
 # ============================================================
-# MCP Protocol (stdio JSON-RPC)
+# MCP Server Instance
 # ============================================================
-
-def _send_msg(msg_bytes):
-    """Write a JSON-RPC message with Content-Length header (MCP stdio transport spec)."""
-    header = f"Content-Length: {len(msg_bytes)}\r\n\r\n".encode('ascii')
-    sys.stdout.buffer.write(header + msg_bytes)
-    sys.stdout.buffer.flush()
-
-
-def send_response(rid, result):
-    msg = json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}, ensure_ascii=False)
-    _send_msg(msg.encode('utf-8'))
-
-
-def send_error(rid, code, message):
-    msg = json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}, ensure_ascii=False)
-    _send_msg(msg.encode('utf-8'))
-
+mcp_server = Server("testcase-generator")
 
 # ============================================================
 # Constants & Paths
@@ -84,6 +66,16 @@ def _resolve_initial_workspace():
     for i, arg in enumerate(sys.argv):
         if arg == "--workspace" and i + 1 < len(sys.argv):
             return os.path.abspath(sys.argv[i + 1])
+    
+    # When running as a Power, __file__ is in ~/.kiro/powers/repos/<power>/server/main.py
+    # The workspace should be passed via --workspace, but if not, use cwd
+    # Check if we're in a Power repo structure
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if 'powers' in script_dir and 'repos' in script_dir:
+        # Running as installed Power - workspace must be passed via --workspace
+        # Fall back to cwd (Kiro should set this correctly)
+        pass
+    
     # Default: cwd (Kiro sets this to workspace root)
     return os.getcwd()
 
@@ -2559,102 +2551,60 @@ HANDLERS = {
     "process_images_with_llm": handle_process_images_with_llm,
 }
 
+# ============================================================
+# MCP SDK Tool Registration
+# ============================================================
 
-def handle_request(req):
-    method = req.get("method", "")
-    rid = req.get("id")
-    params = req.get("params", {})
+@mcp_server.list_tools()
+async def list_tools():
+    """Return list of available tools."""
+    return [
+        Tool(
+            name=tool["name"],
+            description=tool["description"],
+            inputSchema=tool["inputSchema"]
+        )
+        for tool in TOOLS
+    ]
 
-    sys.stderr.write(f"[MCP] Received: method={method} id={rid}\n")
-    sys.stderr.flush()
 
-    if method == "initialize":
-        send_response(rid, {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "testcase-generator", "version": "7.0.0"}
-        })
-    elif method == "notifications/initialized":
-        pass  # No response needed for notifications
-    elif method == "notifications/cancelled":
-        pass  # No response needed for cancellation notifications
-    elif method == "tools/list":
-        send_response(rid, {"tools": TOOLS})
-    elif method == "tools/call":
-        name = params.get("name", "")
-        handler = HANDLERS.get(name)
-        if handler:
-            try:
-                result = handler(params.get("arguments", {}))
-                send_response(rid, result)
-            except Exception as e:
-                tb = traceback.format_exc()
-                sys.stderr.write(f"[MCP] Tool error in {name}: {tb}\n")
-                sys.stderr.flush()
-                send_response(rid, {"content": [{"type": "text", "text": f"Error in {name}: {e}"}], "isError": True})
+@mcp_server.call_tool()
+async def call_tool(name: str, arguments: dict):
+    """Handle tool calls."""
+    handler = HANDLERS.get(name)
+    if not handler:
+        raise ValueError(f"Unknown tool: {name}")
+    
+    try:
+        result = handler(arguments)
+        # Convert result to MCP format
+        if isinstance(result, dict) and "content" in result:
+            content = result["content"]
+            # Convert dict content items to TextContent
+            return [
+                TextContent(type=item.get("type", "text"), text=item.get("text", ""))
+                if isinstance(item, dict) else item
+                for item in content
+            ]
         else:
-            send_error(rid, -32601, f"Unknown tool: {name}")
-    elif method == "ping":
-        send_response(rid, {})
-    else:
-        if rid is not None:
-            send_error(rid, -32601, f"Method not found: {method}")
+            # Wrap plain result in TextContent
+            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
+    except Exception as e:
+        tb = traceback.format_exc()
+        sys.stderr.write(f"[MCP] Tool error in {name}: {tb}\n")
+        sys.stderr.flush()
+        raise
 
 
-def main():
+async def main():
     sys.stderr.write("TestCase Generator MCP Server v7.0 starting...\n")
     sys.stderr.write(f"  Workspace: {_INITIAL_WORKSPACE}\n")
     sys.stderr.write(f"  Python: {sys.version.split()[0]}\n")
     sys.stderr.flush()
 
-    while True:
-        try:
-            line = sys.stdin.buffer.readline()
-            if not line:
-                sys.stderr.write("[MCP] stdin closed, shutting down.\n")
-                sys.stderr.flush()
-                return
-
-            stripped = line.strip()
-            if not stripped:
-                continue
-
-            decoded = stripped.decode('utf-8', errors='replace')
-
-            if decoded.startswith('{'):
-                try:
-                    request = json.loads(decoded)
-                    handle_request(request)
-                except json.JSONDecodeError as e:
-                    sys.stderr.write(f"[MCP] JSON parse error: {e}\n")
-                    sys.stderr.flush()
-            elif decoded.lower().startswith('content-length'):
-                try:
-                    cl = int(decoded.split(":", 1)[1].strip())
-                except (ValueError, IndexError):
-                    continue
-                sys.stdin.buffer.readline()  # skip blank line
-                body = b""
-                while len(body) < cl:
-                    chunk = sys.stdin.buffer.read(cl - len(body))
-                    if not chunk:
-                        break
-                    body += chunk
-                if body:
-                    try:
-                        request = json.loads(body.decode('utf-8'))
-                        handle_request(request)
-                    except json.JSONDecodeError as e:
-                        sys.stderr.write(f"[MCP] JSON parse error: {e}\n")
-                        sys.stderr.flush()
-        except KeyboardInterrupt:
-            sys.stderr.write("[MCP] Interrupted, shutting down.\n")
-            sys.stderr.flush()
-            return
-        except Exception as e:
-            sys.stderr.write(f"[MCP] Error in main loop: {e}\n")
-            sys.stderr.flush()
+    async with stdio_server() as (read_stream, write_stream):
+        await mcp_server.run(read_stream, write_stream, mcp_server.create_initialization_options())
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
