@@ -1339,11 +1339,17 @@ def handle_setup_environment(args):
         sys.stderr.write(f"[setup]   checking {imp} ({pip_name})...\n")
         sys.stderr.flush()
         try:
+            sys.stderr.write(f"[setup]   >>> __import__('{imp}') starting...\n")
+            sys.stderr.flush()
             __import__(imp)
+            sys.stderr.write(f"[setup]   <<< __import__('{imp}') returned OK ({time.time()-t1:.3f}s)\n")
+            sys.stderr.flush()
             results.append(f"  [ok] {pip_name}")
             sys.stderr.write(f"[setup]   {imp} OK ({time.time()-t1:.2f}s)\n")
             sys.stderr.flush()
-        except ImportError:
+        except ImportError as ie:
+            sys.stderr.write(f"[setup]   <<< __import__('{imp}') ImportError: {ie} ({time.time()-t1:.3f}s)\n")
+            sys.stderr.flush()
             results.append(f"  [installing] {pip_name}...")
             sys.stderr.write(f"[setup]   {imp} not found, calling _ensure_pkg...\n")
             sys.stderr.flush()
@@ -1356,6 +1362,11 @@ def handle_setup_environment(args):
                 all_ok = False
                 sys.stderr.write(f"[setup]   {imp} FAILED ({time.time()-t1:.2f}s)\n")
                 sys.stderr.flush()
+        except Exception as ex:
+            sys.stderr.write(f"[setup]   <<< __import__('{imp}') UNEXPECTED ERROR: {type(ex).__name__}: {ex} ({time.time()-t1:.3f}s)\n")
+            sys.stderr.flush()
+            results.append(f"  [FAIL] {pip_name} (unexpected: {ex})")
+            all_ok = False
 
     sys.stderr.write(f"[setup] Phase 1 done ({time.time()-t0:.2f}s)\n")
     sys.stderr.flush()
