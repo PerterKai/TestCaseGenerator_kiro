@@ -39,6 +39,7 @@ pip install python-docx Pillow openpyxl
 │   └── testcase-generation-workflow.md
 ├── server/                  # MCP Server 实现
 │   ├── main.py              # MCP Server 主程序（全部工具实现）
+│   ├── launcher.py           # MCP Server 启动器（自动定位 main.py）
 │   └── gui_llm_config.py    # 外部 LLM API 配置 GUI（tkinter）
 ├── requirements.txt         # Python 依赖
 └── README.md

@@ -222,11 +222,13 @@ def _img_mime(ext):
 
 
 def _generate_image_id(doc_name, img_name):
+    """Generate a unique image ID. Always uses .png extension since all images
+    are converted to PNG during extraction (grayscale optimization)."""
     raw = f"{doc_name}_{img_name}"
     short_hash = hashlib.md5(raw.encode()).hexdigest()[:8]
     base = os.path.splitext(img_name)[0]
-    ext = os.path.splitext(img_name)[1]
-    return f"{base}_{short_hash}{ext}"
+    # Always use .png — images are converted to PNG in _resize_image
+    return f"{base}_{short_hash}.png"
 
 
 def _resize_image(img_data, ext):
@@ -1532,8 +1534,8 @@ def handle_parse_documents(args):
                 skipped = 0
                 for img_id, (img_data, ext) in image_data_map.items():
                     resized_data, mime = _resize_image(img_data, ext)
-                    out_ext = ".png"
-                    img_filename = os.path.splitext(img_id)[0] + out_ext
+                    # img_id already has .png extension (from _generate_image_id)
+                    img_filename = img_id
                     img_path = os.path.join(TMP_PIC_DIR, img_filename)
                     # Store relative path for cross-workspace portability
                     img_rel_path = os.path.join(".tmp", "picture", img_filename)
