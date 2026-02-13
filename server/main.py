@@ -21,14 +21,8 @@ import hashlib
 import shutil
 import threading
 import traceback
-import asyncio
 from io import BytesIO
 from xml.etree import ElementTree as ET
-
-# MCP SDK imports
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
 
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
@@ -73,9 +67,21 @@ def _ensure_pkg(import_name, pip_name):
         return False
 
 # ============================================================
-# MCP Server Instance
+# JSON-RPC helpers
 # ============================================================
-mcp_server = Server("testcase-generator")
+
+def send_response(rid, result):
+    msg = json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}, ensure_ascii=False)
+    raw = msg.encode('utf-8')
+    sys.stdout.buffer.write(raw + b"\n")
+    sys.stdout.buffer.flush()
+
+
+def send_error(rid, code, message):
+    msg = json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}, ensure_ascii=False)
+    raw = msg.encode('utf-8')
+    sys.stdout.buffer.write(raw + b"\n")
+    sys.stdout.buffer.flush()
 
 # ============================================================
 # Constants & Paths
@@ -2616,85 +2622,94 @@ HANDLERS = {
     "process_images_with_llm": handle_process_images_with_llm,
 }
 
-# ============================================================
-# MCP SDK Tool Registration
-# ============================================================
 
-@mcp_server.list_tools()
-async def list_tools():
-    """Return list of available tools."""
-    sys.stderr.write(f"[MCP] list_tools called, returning {len(TOOLS)} tools\n")
-    sys.stderr.flush()
-    return [
-        Tool(
-            name=tool["name"],
-            description=tool["description"],
-            inputSchema=tool["inputSchema"]
-        )
-        for tool in TOOLS
-    ]
+def handle_request(req):
+    method = req.get("method", "")
+    rid = req.get("id")
+    params = req.get("params", {})
 
-
-@mcp_server.call_tool()
-async def call_tool(name: str, arguments: dict):
-    """Handle tool calls. Runs sync handlers in a thread pool to avoid blocking the event loop."""
-    import time
-    t0 = time.time()
-    sys.stderr.write(f"[MCP] call_tool: {name} called with {list(arguments.keys())}\n")
+    sys.stderr.write(f"[MCP] Received: method={method} id={rid}\n")
     sys.stderr.flush()
 
-    handler = HANDLERS.get(name)
-    if not handler:
-        raise ValueError(f"Unknown tool: {name}")
-    
-    try:
-        # Run synchronous handler in thread pool so it doesn't block
-        # the asyncio event loop (which MCP SDK needs for heartbeats/notifications)
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, handler, arguments)
-        sys.stderr.write(f"[MCP] call_tool: {name} completed in {time.time()-t0:.2f}s\n")
-        sys.stderr.flush()
-        
-        # Convert result to MCP format
-        if isinstance(result, dict) and "content" in result:
-            content = result["content"]
-            return [
-                TextContent(type=item.get("type", "text"), text=item.get("text", ""))
-                if isinstance(item, dict) else item
-                for item in content
-            ]
+    if method == "initialize":
+        send_response(rid, {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "testcase-generator", "version": "7.0.0"}
+        })
+    elif method == "notifications/initialized":
+        pass  # No response needed for notifications
+    elif method == "tools/list":
+        send_response(rid, {"tools": TOOLS})
+    elif method == "tools/call":
+        name = params.get("name", "")
+        handler = HANDLERS.get(name)
+        if handler:
+            try:
+                result = handler(params.get("arguments", {}))
+                send_response(rid, result)
+            except Exception as e:
+                tb = traceback.format_exc()
+                sys.stderr.write(f"[MCP] Tool error in {name}: {tb}\n")
+                sys.stderr.flush()
+                send_response(rid, {"content": [{"type": "text", "text": f"Error in {name}: {e}"}], "isError": True})
         else:
-            return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
-    except Exception:
-        tb = traceback.format_exc()
-        sys.stderr.write(f"[MCP] Tool error in {name} after {time.time()-t0:.2f}s: {tb}\n")
-        sys.stderr.flush()
-        raise
+            send_error(rid, -32601, f"Unknown tool: {name}")
+    elif method == "ping":
+        send_response(rid, {})
+    else:
+        if rid is not None:
+            send_error(rid, -32601, f"Method not found: {method}")
 
 
-async def main():
+def main():
     sys.stderr.write("TestCase Generator MCP Server v7.0 starting...\n")
     sys.stderr.write(f"  Workspace: {_INITIAL_WORKSPACE}\n")
     sys.stderr.write(f"  Python: {sys.version.split()[0]}\n")
-    sys.stderr.write(f"  sys.executable: {sys.executable}\n")
     sys.stderr.flush()
 
-    sys.stderr.write("[MCP] Opening stdio_server...\n")
-    sys.stderr.flush()
-    async with stdio_server() as (read_stream, write_stream):
-        sys.stderr.write("[MCP] stdio_server opened, starting mcp_server.run...\n")
-        sys.stderr.flush()
-        await mcp_server.run(read_stream, write_stream, mcp_server.create_initialization_options())
+    while True:
+        try:
+            line = sys.stdin.buffer.readline()
+            if not line:
+                return
+
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            decoded = stripped.decode('utf-8', errors='replace')
+
+            if decoded.startswith('{'):
+                try:
+                    request = json.loads(decoded)
+                    handle_request(request)
+                except json.JSONDecodeError as e:
+                    sys.stderr.write(f"JSON parse error: {e}\n")
+                    sys.stderr.flush()
+            elif decoded.lower().startswith('content-length'):
+                try:
+                    cl = int(decoded.split(":", 1)[1].strip())
+                except (ValueError, IndexError):
+                    continue
+                sys.stdin.buffer.readline()  # skip blank line
+                body = b""
+                while len(body) < cl:
+                    chunk = sys.stdin.buffer.read(cl - len(body))
+                    if not chunk:
+                        break
+                    body += chunk
+                if body:
+                    try:
+                        request = json.loads(body.decode('utf-8'))
+                        handle_request(request)
+                    except json.JSONDecodeError as e:
+                        sys.stderr.write(f"JSON parse error: {e}\n")
+                        sys.stderr.flush()
+        except Exception as e:
+            sys.stderr.write(f"Error in main loop: {e}\n")
+            sys.stderr.flush()
 
 
 if __name__ == "__main__":
-    # Pre-import heavy modules BEFORE entering asyncio event loop.
-    # openpyxl's deep import chain can deadlock when first imported
-    # inside MCP stdio's async context. Importing here (synchronously,
-    # before stdio streams are set up) avoids the issue entirely.
-    for _mod in ("openpyxl", "docx", "PIL"):
-        try:
-            __import__(_mod)
-        except ImportError:
-            pass  # will be handled by _ensure_pkg later
-    asyncio.run(main())
+    main()
