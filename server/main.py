@@ -1320,10 +1320,20 @@ TOOLS = [
 # ============================================================
 
 
+def _check_pkg_installed(pip_name):
+    """Check if a package is installed without importing it (avoids blocking on heavy imports)."""
+    try:
+        from importlib.metadata import distribution
+        distribution(pip_name)
+        return True
+    except Exception:
+        return False
+
+
 def handle_setup_environment(args):
     import time
     t0 = time.time()
-    sys.stderr.write(f"[setup] === handle_setup_environment START ===\n")
+    sys.stderr.write("[setup] === handle_setup_environment START ===\n")
     sys.stderr.flush()
 
     results = []
@@ -1331,42 +1341,32 @@ def handle_setup_environment(args):
     results.append(f"Python {sys.version.split()[0]}")
 
     # 1. Check Python dependencies
-    sys.stderr.write(f"[setup] Phase 1: checking dependencies...\n")
+    # Use importlib.metadata to check installation without triggering heavy imports
+    # that can deadlock in MCP stdio's asyncio event loop on first run.
+    sys.stderr.write("[setup] Phase 1: checking dependencies...\n")
     sys.stderr.flush()
     deps = {"docx": "python-docx", "PIL": "Pillow", "openpyxl": "openpyxl"}
     for imp, pip_name in deps.items():
         t1 = time.time()
-        sys.stderr.write(f"[setup]   checking {imp} ({pip_name})...\n")
+        sys.stderr.write(f"[setup]   checking {pip_name}...\n")
         sys.stderr.flush()
-        try:
-            sys.stderr.write(f"[setup]   >>> __import__('{imp}') starting...\n")
-            sys.stderr.flush()
-            __import__(imp)
-            sys.stderr.write(f"[setup]   <<< __import__('{imp}') returned OK ({time.time()-t1:.3f}s)\n")
-            sys.stderr.flush()
+        if _check_pkg_installed(pip_name):
             results.append(f"  [ok] {pip_name}")
-            sys.stderr.write(f"[setup]   {imp} OK ({time.time()-t1:.2f}s)\n")
+            sys.stderr.write(f"[setup]   {pip_name} OK ({time.time()-t1:.3f}s)\n")
             sys.stderr.flush()
-        except ImportError as ie:
-            sys.stderr.write(f"[setup]   <<< __import__('{imp}') ImportError: {ie} ({time.time()-t1:.3f}s)\n")
-            sys.stderr.flush()
+        else:
             results.append(f"  [installing] {pip_name}...")
-            sys.stderr.write(f"[setup]   {imp} not found, calling _ensure_pkg...\n")
+            sys.stderr.write(f"[setup]   {pip_name} not found, installing...\n")
             sys.stderr.flush()
             if _ensure_pkg(imp, pip_name):
                 results.append(f"  [ok] {pip_name} installed")
-                sys.stderr.write(f"[setup]   {imp} installed OK ({time.time()-t1:.2f}s)\n")
+                sys.stderr.write(f"[setup]   {pip_name} installed OK ({time.time()-t1:.2f}s)\n")
                 sys.stderr.flush()
             else:
                 results.append(f"  [FAIL] {pip_name}")
                 all_ok = False
-                sys.stderr.write(f"[setup]   {imp} FAILED ({time.time()-t1:.2f}s)\n")
+                sys.stderr.write(f"[setup]   {pip_name} FAILED ({time.time()-t1:.2f}s)\n")
                 sys.stderr.flush()
-        except Exception as ex:
-            sys.stderr.write(f"[setup]   <<< __import__('{imp}') UNEXPECTED ERROR: {type(ex).__name__}: {ex} ({time.time()-t1:.3f}s)\n")
-            sys.stderr.flush()
-            results.append(f"  [FAIL] {pip_name} (unexpected: {ex})")
-            all_ok = False
 
     sys.stderr.write(f"[setup] Phase 1 done ({time.time()-t0:.2f}s)\n")
     sys.stderr.flush()
