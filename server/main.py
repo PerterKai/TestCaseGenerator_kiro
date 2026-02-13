@@ -44,8 +44,8 @@ def _ensure_pkg(import_name, pip_name):
         try:
             subprocess.run(
                 [sys.executable, "-m", "pip", "install", pip_name, "-q"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                timeout=60)  # 60 second timeout
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, timeout=60)
             return True
         except Exception:
             return False
