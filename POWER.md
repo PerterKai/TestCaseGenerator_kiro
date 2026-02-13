@@ -37,7 +37,7 @@ keywords:
 ### 步骤 0: 环境检查与任务决策（每次启动必做）
 
 调用 `setup_environment`，该工具会自动完成以下检查：
-1. **依赖检查**: 检查并安装 Python 依赖（python-docx, Pillow）
+1. **依赖检查**: 检查并安装 Python 依赖（python-docx, Pillow, openpyxl）
 2. **目录检查**: 检查工作目录是否存在，不存在则自动创建：
    - `doc/` — 存放 .docx 源文档
    - `.tmp/doc_mk/` — 转换后的 Markdown 文件
@@ -129,8 +129,8 @@ keywords:
    - **`save_testcases` 必须提供 `modules`（全量数组）或 `append_module`（单个模块对象）之一，不能都不传**
    - **始终优先使用 `append_module`**（单个模块对象，非数组），按模块名自动替换已有模块
    - `modules`（全量替换）仅在模块数量极少（≤3个）时使用，大量用例时禁止使用以避免参数截断
-5. 重复直到所有模块处理完毕
-6. 调用 `get_testcases` 确认用例完整性
+6. 重复直到所有模块处理完毕
+7. 调用 `get_testcases` 确认用例完整性
 
 覆盖维度：正向功能、边界条件、异常处理、安全性、性能、兼容性
 

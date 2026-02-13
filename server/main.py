@@ -20,6 +20,7 @@ import base64
 import hashlib
 import shutil
 import threading
+import traceback
 from io import BytesIO
 from xml.etree import ElementTree as ET
 
@@ -54,18 +55,21 @@ def _ensure_pkg(import_name, pip_name):
 # MCP Protocol (stdio JSON-RPC)
 # ============================================================
 
+def _send_msg(msg_bytes):
+    """Write a JSON-RPC message with Content-Length header (MCP stdio transport spec)."""
+    header = f"Content-Length: {len(msg_bytes)}\r\n\r\n".encode('ascii')
+    sys.stdout.buffer.write(header + msg_bytes)
+    sys.stdout.buffer.flush()
+
+
 def send_response(rid, result):
     msg = json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}, ensure_ascii=False)
-    raw = msg.encode('utf-8')
-    sys.stdout.buffer.write(raw + b"\n")
-    sys.stdout.buffer.flush()
+    _send_msg(msg.encode('utf-8'))
 
 
 def send_error(rid, code, message):
     msg = json.dumps({"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}, ensure_ascii=False)
-    raw = msg.encode('utf-8')
-    sys.stdout.buffer.write(raw + b"\n")
-    sys.stdout.buffer.flush()
+    _send_msg(msg.encode('utf-8'))
 
 
 # ============================================================
@@ -106,6 +110,14 @@ def _workspace():
     return WORKSPACE_DIR or _INITIAL_WORKSPACE
 
 # ============================================================
+# Cache filename constants
+# ============================================================
+CACHE_PHASE_STATE = "phase_state.json"
+CACHE_IMAGE_PROGRESS = "image_progress.json"
+CACHE_TESTCASES = "testcases.json"
+CACHE_DOC_SUMMARY = "doc_summary.json"
+
+# ============================================================
 # Cache / Persistence Layer
 # ============================================================
 
@@ -116,8 +128,12 @@ def _cache_path(filename):
 def _save_cache(filename, data):
     os.makedirs(TMP_CACHE_DIR, exist_ok=True)
     path = _cache_path(filename)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        sys.stderr.write(f"[MCP] Warning: failed to save cache {filename}: {e}\n")
+        sys.stderr.flush()
 
 
 def _load_cache(filename, default=None):
@@ -126,14 +142,15 @@ def _load_cache(filename, default=None):
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            sys.stderr.write(f"[MCP] Warning: failed to load cache {filename}: {e}\n")
+            sys.stderr.flush()
     return default if default is not None else {}
 
 
 def _save_phase_state(phase, status, extra=None):
     """Update phase_state.json with current progress."""
-    state = _load_cache("phase_state.json", {
+    state = _load_cache(CACHE_PHASE_STATE, {
         "current_phase": phase,
         "workspace_dir": _workspace(),
         "phases": {}
@@ -146,7 +163,7 @@ def _save_phase_state(phase, status, extra=None):
     state["phases"][phase]["status"] = status
     if extra:
         state["phases"][phase].update(extra)
-    _save_cache("phase_state.json", state)
+    _save_cache(CACHE_PHASE_STATE, state)
     return state
 
 
@@ -157,7 +174,7 @@ def _reset_phase_state():
         "workspace_dir": _workspace(),
         "phases": {}
     }
-    _save_cache("phase_state.json", state)
+    _save_cache(CACHE_PHASE_STATE, state)
     return state
 
 # ============================================================
@@ -231,19 +248,41 @@ def _resize_image(img_data, ext):
             new_w, new_h = int(w * ratio), int(h * ratio)
             img_obj = img_obj.resize((new_w, new_h), Image.LANCZOS)
 
-        # Force grayscale for document images (tables, flowcharts, text)
-        # Requirement docs rarely need color; grayscale saves ~60% base64 size
+        # Convert to grayscale for document images
         if img_obj.mode not in ('L', 'LA'):
             img_obj = img_obj.convert('L')
 
         buf = BytesIO()
-        # quality=65 is the sweet spot: text stays sharp, ~30% smaller than q80
-        img_obj.save(buf, format='JPEG', quality=65)
-        final_mime = "image/jpeg"
+        img_obj.save(buf, format='PNG', optimize=True)
+        final_mime = "image/png"
         final_data = buf.getvalue()
     except Exception:
         pass
     return final_data, final_mime
+
+
+def _resize_image_for_llm(img_data, mime):
+    """Resize image for LLM vision API: max longest edge 3840, PNG grayscale."""
+    try:
+        from PIL import Image
+        img_obj = Image.open(BytesIO(img_data))
+        w, h = img_obj.size
+
+        MAX_DIM = 3840
+        if w > MAX_DIM or h > MAX_DIM:
+            ratio = min(MAX_DIM / w, MAX_DIM / h)
+            new_w, new_h = int(w * ratio), int(h * ratio)
+            img_obj = img_obj.resize((new_w, new_h), Image.LANCZOS)
+
+        # Convert to grayscale
+        if img_obj.mode not in ('L', 'LA'):
+            img_obj = img_obj.convert('L')
+
+        buf = BytesIO()
+        img_obj.save(buf, format='PNG', optimize=True)
+        return buf.getvalue(), "image/png"
+    except Exception:
+        return img_data, mime
 
 # ============================================================
 # DOCX → Markdown + Images extraction
@@ -313,8 +352,9 @@ def _build_rid_to_media(filepath):
             if unreferenced:
                 sys.stderr.write(f"[MCP] Found {len(unreferenced)} unreferenced media files: {unreferenced}\n")
                 sys.stderr.flush()
-    except Exception:
-        pass
+    except Exception as e:
+        sys.stderr.write(f"[MCP] Warning: failed to build rid_to_media for {filepath}: {e}\n")
+        sys.stderr.flush()
     return rid_to_media, header_footer_media
 
 
@@ -767,8 +807,9 @@ def convert_docx_to_markdown(filepath):
                     annotation = f"<!-- 已跳过(小图标/背景图): {sid} -->"
                     md_text = md_text.replace(placeholder, annotation)
                 md_lines = md_text.split("\n")
-    except Exception:
-        pass
+    except Exception as e:
+        sys.stderr.write(f"[MCP] Warning: error during image extraction: {e}\n")
+        sys.stderr.flush()
 
     return "\n".join(md_lines), image_registry, image_data_map
 
@@ -953,24 +994,24 @@ testcase_store = {
 
 def _sync_store_to_cache():
     """Persist critical store data to cache files."""
-    _save_cache("image_progress.json", {
+    _save_cache(CACHE_IMAGE_PROGRESS, {
         "pending_images": testcase_store["pending_images"],
         "md_files": testcase_store["md_files"],
     })
     # Always write testcases (even empty) to avoid stale cache
-    _save_cache("testcases.json", {
+    _save_cache(CACHE_TESTCASES, {
         "modules": testcase_store["modules"],
     })
 
 
 def _restore_store_from_cache():
     """Restore store from cache files (for session resume)."""
-    img_data = _load_cache("image_progress.json")
+    img_data = _load_cache(CACHE_IMAGE_PROGRESS)
     if img_data:
         testcase_store["pending_images"] = img_data.get("pending_images", [])
         testcase_store["md_files"] = img_data.get("md_files", [])
 
-    tc_data = _load_cache("testcases.json")
+    tc_data = _load_cache(CACHE_TESTCASES)
     if tc_data:
         testcase_store["modules"] = tc_data.get("modules", [])
 
@@ -1054,7 +1095,7 @@ def _build_doc_summary():
         summary["total_sections"] += len(sections)
 
     # Also save to cache
-    _save_cache("doc_summary.json", summary)
+    _save_cache(CACHE_DOC_SUMMARY, summary)
     return summary
 
 # ============================================================
@@ -1064,7 +1105,8 @@ def _build_doc_summary():
 def _esc(text):
     if not text:
         return ""
-    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+    return (text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            .replace('"', '&quot;').replace("'", '&apos;'))
 
 
 def create_xmind_file(modules, output_path):
@@ -1307,7 +1349,7 @@ def handle_setup_environment(args):
     # 3. Check for cached tasks
     has_cache = False
     cache_info = {}
-    existing_state = _load_cache("phase_state.json")
+    existing_state = _load_cache(CACHE_PHASE_STATE)
     if existing_state and existing_state.get("phases"):
         has_cache = True
         # Gather cache details
@@ -1359,7 +1401,7 @@ def handle_clear_cache(args):
     cleared = []
 
     # Clear cache files
-    for cache_file in ("phase_state.json", "image_progress.json", "testcases.json", "doc_summary.json"):
+    for cache_file in (CACHE_PHASE_STATE, CACHE_IMAGE_PROGRESS, CACHE_TESTCASES, CACHE_DOC_SUMMARY):
         cache_fp = _cache_path(cache_file)
         if os.path.exists(cache_fp):
             os.remove(cache_fp)
@@ -1399,7 +1441,7 @@ def handle_parse_documents(args):
 
     # Protection: check if there's an in-progress workflow
     if not force:
-        existing_state = _load_cache("phase_state.json")
+        existing_state = _load_cache(CACHE_PHASE_STATE)
         if existing_state:
             phases = existing_state.get("phases", {})
             # Check for in-progress image analysis
@@ -1437,7 +1479,7 @@ def handle_parse_documents(args):
     os.makedirs(TMP_CACHE_DIR, exist_ok=True)
 
     # Reset all cache state files when re-parsing
-    for cache_file in ("phase_state.json", "image_progress.json", "testcases.json", "doc_summary.json"):
+    for cache_file in (CACHE_PHASE_STATE, CACHE_IMAGE_PROGRESS, CACHE_TESTCASES, CACHE_DOC_SUMMARY):
         cache_fp = _cache_path(cache_file)
         if os.path.exists(cache_fp):
             os.remove(cache_fp)
@@ -1581,7 +1623,7 @@ def handle_get_workflow_state(args):
     # Try to restore from cache
     _restore_store_from_cache()
 
-    state = _load_cache("phase_state.json")
+    state = _load_cache(CACHE_PHASE_STATE)
     if not state:
         return {"content": [{"type": "text", "text": "没有找到已保存的工作流状态。请从 parse_documents 开始新的工作流。"}],
                 "has_state": False}
@@ -1929,13 +1971,13 @@ def _get_requirement_name():
         # Prefer requirement docs over design docs
         if "需求" in name or "requirement" in name.lower():
             # Clean up common prefixes like [需求] or 【主prd】
-            name = re.sub(r'^[\[【].*?[\]】]', '', name).strip()
+            name = re.sub(r'^[\[【][^\]】]*[\]】]', '', name).strip()
             if name:
                 return name
     # Fallback: use first doc name
     if md_files:
         name = os.path.splitext(md_files[0].get("name", "test_cases"))[0]
-        name = re.sub(r'^[\[【].*?[\]】]', '', name).strip()
+        name = re.sub(r'^[\[【][^\]】]*[\]】]', '', name).strip()
         return name or "test_cases"
     return "test_cases"
 
@@ -2285,8 +2327,12 @@ def _process_single_image(img_info, api_url, api_key, model, prompt):
     try:
         with open(img_file_path, 'rb') as f:
             img_data = f.read()
-        b64 = base64.b64encode(img_data).decode('ascii')
         mime = img_info.get("mime", "image/png")
+
+        # Resize for LLM: max longest edge 3840, quality 90
+        img_data, mime = _resize_image_for_llm(img_data, mime)
+
+        b64 = base64.b64encode(img_data).decode('ascii')
 
         # Import from gui module
         gui_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2526,6 +2572,8 @@ def handle_request(req):
         })
     elif method == "notifications/initialized":
         pass  # No response needed for notifications
+    elif method == "notifications/cancelled":
+        pass  # No response needed for cancellation notifications
     elif method == "tools/list":
         send_response(rid, {"tools": TOOLS})
     elif method == "tools/call":
@@ -2536,7 +2584,6 @@ def handle_request(req):
                 result = handler(params.get("arguments", {}))
                 send_response(rid, result)
             except Exception as e:
-                import traceback
                 tb = traceback.format_exc()
                 sys.stderr.write(f"[MCP] Tool error in {name}: {tb}\n")
                 sys.stderr.flush()
@@ -2552,12 +2599,16 @@ def handle_request(req):
 
 def main():
     sys.stderr.write("TestCase Generator MCP Server v7.0 starting...\n")
+    sys.stderr.write(f"  Workspace: {_INITIAL_WORKSPACE}\n")
+    sys.stderr.write(f"  Python: {sys.version.split()[0]}\n")
     sys.stderr.flush()
 
     while True:
         try:
             line = sys.stdin.buffer.readline()
             if not line:
+                sys.stderr.write("[MCP] stdin closed, shutting down.\n")
+                sys.stderr.flush()
                 return
 
             stripped = line.strip()
@@ -2571,7 +2622,7 @@ def main():
                     request = json.loads(decoded)
                     handle_request(request)
                 except json.JSONDecodeError as e:
-                    sys.stderr.write(f"JSON parse error: {e}\n")
+                    sys.stderr.write(f"[MCP] JSON parse error: {e}\n")
                     sys.stderr.flush()
             elif decoded.lower().startswith('content-length'):
                 try:
@@ -2590,10 +2641,14 @@ def main():
                         request = json.loads(body.decode('utf-8'))
                         handle_request(request)
                     except json.JSONDecodeError as e:
-                        sys.stderr.write(f"JSON parse error: {e}\n")
+                        sys.stderr.write(f"[MCP] JSON parse error: {e}\n")
                         sys.stderr.flush()
+        except KeyboardInterrupt:
+            sys.stderr.write("[MCP] Interrupted, shutting down.\n")
+            sys.stderr.flush()
+            return
         except Exception as e:
-            sys.stderr.write(f"Error in main loop: {e}\n")
+            sys.stderr.write(f"[MCP] Error in main loop: {e}\n")
             sys.stderr.flush()
 
 
