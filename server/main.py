@@ -42,9 +42,10 @@ def _ensure_pkg(import_name, pip_name):
         return True
     except ImportError:
         try:
-            subprocess.check_call(
+            subprocess.run(
                 [sys.executable, "-m", "pip", "install", pip_name, "-q"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=60)  # 60 second timeout
             return True
         except Exception:
             return False
@@ -2576,7 +2577,8 @@ async def call_tool(name: str, arguments: dict):
         raise ValueError(f"Unknown tool: {name}")
     
     try:
-        result = handler(arguments)
+        # Run synchronous handler in thread pool to avoid blocking event loop
+        result = await asyncio.to_thread(handler, arguments)
         # Convert result to MCP format
         if isinstance(result, dict) and "content" in result:
             content = result["content"]
