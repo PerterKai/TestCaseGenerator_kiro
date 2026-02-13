@@ -68,16 +68,13 @@ def _resolve_initial_workspace():
         if arg == "--workspace" and i + 1 < len(sys.argv):
             return os.path.abspath(sys.argv[i + 1])
     
-    # When running as a Power, __file__ is in ~/.kiro/powers/repos/<power>/server/main.py
-    # The workspace should be passed via --workspace, but if not, use cwd
-    # Check if we're in a Power repo structure
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    if 'powers' in script_dir and 'repos' in script_dir:
-        # Running as installed Power - workspace must be passed via --workspace
-        # Fall back to cwd (Kiro should set this correctly)
-        pass
+    # Check environment variables that Kiro might set
+    for env_var in ['KIRO_WORKSPACE', 'WORKSPACE_FOLDER', 'PWD']:
+        ws = os.environ.get(env_var)
+        if ws and os.path.isdir(ws):
+            return os.path.abspath(ws)
     
-    # Default: cwd (Kiro sets this to workspace root)
+    # Default: cwd
     return os.getcwd()
 
 _INITIAL_WORKSPACE = _resolve_initial_workspace()
@@ -2577,19 +2574,17 @@ async def call_tool(name: str, arguments: dict):
         raise ValueError(f"Unknown tool: {name}")
     
     try:
-        # Run synchronous handler in thread pool to avoid blocking event loop
-        result = await asyncio.to_thread(handler, arguments)
+        result = handler(arguments)
+        
         # Convert result to MCP format
         if isinstance(result, dict) and "content" in result:
             content = result["content"]
-            # Convert dict content items to TextContent
             return [
                 TextContent(type=item.get("type", "text"), text=item.get("text", ""))
                 if isinstance(item, dict) else item
                 for item in content
             ]
         else:
-            # Wrap plain result in TextContent
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
     except Exception as e:
         tb = traceback.format_exc()
