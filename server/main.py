@@ -205,10 +205,16 @@ def _should_process_image(w, h):
 # Image helpers
 # ============================================================
 
+# Common MIME types and paths
+MIME_PNG = "image/png"
+WORD_MEDIA_PATH = "word/media/"
+WORD_PATH = "word/"
+WORD_DOCUMENT_XML = "word/document.xml"
+
 def _img_mime(ext):
-    return {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    return {"png": MIME_PNG, "jpg": "image/jpeg", "jpeg": "image/jpeg",
             "gif": "image/gif", "bmp": "image/bmp", "tiff": "image/tiff",
-            "emf": "image/emf", "wmf": "image/wmf"}.get(ext.lower().lstrip('.'), "image/png")
+            "emf": "image/emf", "wmf": "image/wmf"}.get(ext.lower().lstrip('.'), MIME_PNG)
 
 
 def _generate_image_id(doc_name, img_name):
@@ -247,7 +253,7 @@ def _resize_image(img_data, ext):
         buf = BytesIO()
         img_obj.save(buf, format='PNG', optimize=True)
         final_data = buf.getvalue()
-        final_mime = "image/png"
+        final_mime = MIME_PNG
     except Exception:
         # Pillow failed — still try to ensure PNG extension consistency
         # by returning original data with original mime
@@ -274,7 +280,7 @@ def _resize_image_for_llm(img_data, mime):
 
         buf = BytesIO()
         img_obj.save(buf, format='PNG', optimize=True)
-        return buf.getvalue(), "image/png"
+        return buf.getvalue(), MIME_PNG
     except Exception:
         return img_data, mime
 
@@ -290,7 +296,7 @@ def _build_rid_to_media(filepath):
             # Collect all actual media files in the zip for cross-reference
             actual_media = set()
             for name in z.namelist():
-                if name.startswith('word/media/'):
+                if name.startswith(WORD_MEDIA_PATH):
                     actual_media.add(os.path.basename(name))
 
             # Track which media are referenced by document.xml vs headers/footers
@@ -299,7 +305,7 @@ def _build_rid_to_media(filepath):
 
             # Parse all .rels files under word/ (document, headers, footers, etc.)
             rels_files = [n for n in z.namelist()
-                          if n.startswith('word/') and n.endswith('.rels')]
+                          if n.startswith(WORD_PATH) and n.endswith('.rels')]
             for rels_path in rels_files:
                 # Determine if this rels file belongs to a header/footer
                 rels_basename = os.path.basename(rels_path).replace('.rels', '')
@@ -364,7 +370,7 @@ def _build_ole_excel_map(filepath):
     ole_map = {}  # media_name -> xlsx_zip_path
     try:
         with zipfile.ZipFile(filepath, 'r') as z:
-            if 'word/document.xml' not in z.namelist():
+            if WORD_DOCUMENT_XML not in z.namelist():
                 return ole_map
             
             # Build rId -> target mapping from rels
@@ -379,7 +385,7 @@ def _build_ole_excel_map(filepath):
             W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
             R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
             
-            doc_root = ET.fromstring(z.read('word/document.xml'))
+            doc_root = ET.fromstring(z.read(WORD_DOCUMENT_XML))
             for obj in doc_root.iter(f'{{{W_NS}}}object'):
                 ole_elem = None
                 img_rid = None
@@ -406,7 +412,7 @@ def _build_ole_excel_map(filepath):
                         # img_target is like "media/image1.png"
                         img_media_name = img_target.split('/')[-1]
                         # ole_target is like "embeddings/xxx.xlsx"
-                        xlsx_path = 'word/' + ole_target if not ole_target.startswith('word/') else ole_target
+                        xlsx_path = WORD_PATH + ole_target if not ole_target.startswith(WORD_PATH) else ole_target
                         if xlsx_path in z.namelist():
                             ole_map[img_media_name] = xlsx_path
                             sys.stderr.write(f"[MCP] OLE Excel detected: {img_media_name} -> {xlsx_path}\n")
@@ -532,11 +538,11 @@ def _detect_heading_level(para):
         except ValueError:
             return 1
     try:
-        pPr = para._element.find(f'{W_NS}pPr')
-        if pPr is not None:
-            outlineLvl = pPr.find(f'{W_NS}outlineLvl')
-            if outlineLvl is not None:
-                val = int(outlineLvl.get(f'{W_NS}val', '-1'))
+        para_props = para._element.find(f'{W_NS}pPr')
+        if para_props is not None:
+            outline_lvl = para_props.find(f'{W_NS}outlineLvl')
+            if outline_lvl is not None:
+                val = int(outline_lvl.get(f'{W_NS}val', '-1'))
                 if val >= 0:
                     return val + 1
     except Exception:
@@ -716,7 +722,7 @@ def convert_docx_to_markdown(filepath):
 
     try:
         with zipfile.ZipFile(filepath, 'r') as z:
-            media = [n for n in z.namelist() if n.startswith('word/media/')]
+            media = [n for n in z.namelist() if n.startswith(WORD_MEDIA_PATH)]
             skipped_ids = []
 
             # Also detect orphan images (in zip but not referenced by any paragraph/table)
@@ -819,8 +825,8 @@ def _convert_docx_raw(filepath):
     try:
         with zipfile.ZipFile(filepath, 'r') as z:
             W = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-            if 'word/document.xml' in z.namelist():
-                root = ET.fromstring(z.read('word/document.xml'))
+            if WORD_DOCUMENT_XML in z.namelist():
+                root = ET.fromstring(z.read(WORD_DOCUMENT_XML))
                 body = root.find(f'{W}body')
                 if body is None:
                     body = root
@@ -833,11 +839,11 @@ def _convert_docx_raw(filepath):
                         para_images = _find_images_in_element(child, rid_to_media)
                         _has_ole_embed = any(n in ole_preview_names for n in para_images) if para_images else False
                         if text and not (_has_ole_embed and '点击图片可查看完整电子表格' in text):
-                            pPr = child.find(f'{W}pPr')
-                            if pPr is not None:
-                                pStyle = pPr.find(f'{W}pStyle')
-                                if pStyle is not None:
-                                    sv = pStyle.get(f'{W}val', '')
+                            para_props = child.find(f'{W}pPr')
+                            if para_props is not None:
+                                para_style = para_props.find(f'{W}pStyle')
+                                if para_style is not None:
+                                    sv = para_style.get(f'{W}val', '')
                                     if 'Heading' in sv or 'heading' in sv:
                                         is_heading = True
                                         m = re.search(r'\d+', sv)
@@ -887,7 +893,7 @@ def _convert_docx_raw(filepath):
                                     row.append("")
                                 md_lines.append("| " + " | ".join(row[:len(rows[0])]) + " |")
                             md_lines.append("")
-            media = [n for n in z.namelist() if n.startswith('word/media/')]
+            media = [n for n in z.namelist() if n.startswith(WORD_MEDIA_PATH)]
             skipped_ids = []
 
             # Detect orphan images (in zip but not referenced by any element)
@@ -2090,13 +2096,13 @@ def handle_review_module_structure(args):
         lines.extend(issues)
 
     if suggestions:
-        lines.append(f"\n优化建议:")
+        lines.append("\n优化建议:")
         lines.extend(suggestions)
 
     if not issues and not suggestions:
         lines.append("\n✅ 模块结构合理，未发现明显问题。")
 
-    lines.append(f"\n如需调整模块结构，请对需要修改的模块逐个调用 save_testcases(append_module=调整后的单个模块对象) 保存。")
+    lines.append("\n如需调整模块结构，请对需要修改的模块逐个调用 save_testcases(append_module=调整后的单个模块对象) 保存。")
 
     return {
         "content": [{"type": "text", "text": "\n".join(lines)}],
@@ -2182,7 +2188,7 @@ def handle_export_report(args):
         lines.append("")
 
     # Coverage dimension summary
-    all_dims = {dim: 0 for dim in _COVERAGE_DIMS}
+    all_dims = dict.fromkeys(_COVERAGE_DIMS, 0)
     for m in modules:
         for s in m.get("sub_modules", []):
             for c in s.get("test_cases", []):
@@ -2321,7 +2327,7 @@ def _process_single_image(img_info, api_url, api_key, model, prompt):
     try:
         with open(img_file_path, 'rb') as f:
             img_data = f.read()
-        mime = img_info.get("mime", "image/png")
+        mime = img_info.get("mime", MIME_PNG)
 
         # Resize for LLM: max longest edge 2048, grayscale PNG
         img_data, mime = _resize_image_for_llm(img_data, mime)
@@ -2586,7 +2592,7 @@ async def call_tool(name: str, arguments: dict):
             ]
         else:
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
-    except Exception as e:
+    except Exception:
         tb = traceback.format_exc()
         sys.stderr.write(f"[MCP] Tool error in {name}: {tb}\n")
         sys.stderr.flush()
