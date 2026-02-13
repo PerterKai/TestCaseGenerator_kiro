@@ -2637,7 +2637,7 @@ async def list_tools():
 
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict):
-    """Handle tool calls."""
+    """Handle tool calls. Runs sync handlers in a thread pool to avoid blocking the event loop."""
     import time
     t0 = time.time()
     sys.stderr.write(f"[MCP] call_tool: {name} called with {list(arguments.keys())}\n")
@@ -2648,7 +2648,10 @@ async def call_tool(name: str, arguments: dict):
         raise ValueError(f"Unknown tool: {name}")
     
     try:
-        result = handler(arguments)
+        # Run synchronous handler in thread pool so it doesn't block
+        # the asyncio event loop (which MCP SDK needs for heartbeats/notifications)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, handler, arguments)
         sys.stderr.write(f"[MCP] call_tool: {name} completed in {time.time()-t0:.2f}s\n")
         sys.stderr.flush()
         
