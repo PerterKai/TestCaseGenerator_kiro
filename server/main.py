@@ -241,8 +241,8 @@ def _resize_image(img_data, ext):
         if not _should_process_image(w, h):
             return final_data, final_mime
 
-        # Resize large images, scale based on content density
-        MAX_DIM = 1568  # Claude vision optimal tile boundary (multiple of 784)
+        # Resize large images: max longest edge 2048, proportional scaling
+        MAX_DIM = 2048
         if w > MAX_DIM or h > MAX_DIM:
             ratio = min(MAX_DIM / w, MAX_DIM / h)
             new_w, new_h = int(w * ratio), int(h * ratio)
@@ -262,13 +262,13 @@ def _resize_image(img_data, ext):
 
 
 def _resize_image_for_llm(img_data, mime):
-    """Resize image for LLM vision API: max longest edge 3840, PNG grayscale."""
+    """Resize image for LLM vision API: max longest edge 2048, grayscale PNG."""
     try:
         from PIL import Image
         img_obj = Image.open(BytesIO(img_data))
         w, h = img_obj.size
 
-        MAX_DIM = 3840
+        MAX_DIM = 2048
         if w > MAX_DIM or h > MAX_DIM:
             ratio = min(MAX_DIM / w, MAX_DIM / h)
             new_w, new_h = int(w * ratio), int(h * ratio)
@@ -2329,7 +2329,7 @@ def _process_single_image(img_info, api_url, api_key, model, prompt):
             img_data = f.read()
         mime = img_info.get("mime", "image/png")
 
-        # Resize for LLM: max longest edge 3840, quality 90
+        # Resize for LLM: max longest edge 2048, grayscale PNG
         img_data, mime = _resize_image_for_llm(img_data, mime)
 
         b64 = base64.b64encode(img_data).decode('ascii')
