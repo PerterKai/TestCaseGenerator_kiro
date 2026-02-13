@@ -248,15 +248,17 @@ def _resize_image(img_data, ext):
             new_w, new_h = int(w * ratio), int(h * ratio)
             img_obj = img_obj.resize((new_w, new_h), Image.LANCZOS)
 
-        # Convert to grayscale for document images
+        # Always convert to grayscale PNG for document images
         if img_obj.mode not in ('L', 'LA'):
             img_obj = img_obj.convert('L')
 
         buf = BytesIO()
         img_obj.save(buf, format='PNG', optimize=True)
-        final_mime = "image/png"
         final_data = buf.getvalue()
+        final_mime = "image/png"
     except Exception:
+        # Pillow failed — still try to ensure PNG extension consistency
+        # by returning original data with original mime
         pass
     return final_data, final_mime
 
@@ -1530,7 +1532,7 @@ def handle_parse_documents(args):
                 skipped = 0
                 for img_id, (img_data, ext) in image_data_map.items():
                     resized_data, mime = _resize_image(img_data, ext)
-                    out_ext = ".png" if "png" in mime else ".jpg"
+                    out_ext = ".png"
                     img_filename = os.path.splitext(img_id)[0] + out_ext
                     img_path = os.path.join(TMP_PIC_DIR, img_filename)
                     # Store relative path for cross-workspace portability
