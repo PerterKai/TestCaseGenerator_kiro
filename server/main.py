@@ -39,15 +39,29 @@ sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 def _ensure_pkg(import_name, pip_name):
     try:
         __import__(import_name)
+        sys.stderr.write(f"[setup] _ensure_pkg: {import_name} already installed\n")
+        sys.stderr.flush()
         return True
     except ImportError:
+        sys.stderr.write(f"[setup] _ensure_pkg: {import_name} not found, installing {pip_name}...\n")
+        sys.stderr.flush()
         try:
-            subprocess.run(
+            result = subprocess.run(
                 [sys.executable, "-m", "pip", "install", pip_name, "-q"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE, timeout=60)
+            sys.stderr.write(f"[setup] _ensure_pkg: pip install {pip_name} finished, returncode={result.returncode}\n")
+            if result.stderr:
+                sys.stderr.write(f"[setup] _ensure_pkg: pip stderr: {result.stderr[:500]}\n")
+            sys.stderr.flush()
             return True
-        except Exception:
+        except subprocess.TimeoutExpired:
+            sys.stderr.write(f"[setup] _ensure_pkg: pip install {pip_name} TIMEOUT (60s)\n")
+            sys.stderr.flush()
+            return False
+        except Exception as e:
+            sys.stderr.write(f"[setup] _ensure_pkg: pip install {pip_name} EXCEPTION: {e}\n")
+            sys.stderr.flush()
             return False
 
 # ============================================================
@@ -1307,25 +1321,48 @@ TOOLS = [
 
 
 def handle_setup_environment(args):
+    import time
+    t0 = time.time()
+    sys.stderr.write(f"[setup] === handle_setup_environment START ===\n")
+    sys.stderr.flush()
+
     results = []
     all_ok = True
     results.append(f"Python {sys.version.split()[0]}")
 
     # 1. Check Python dependencies
+    sys.stderr.write(f"[setup] Phase 1: checking dependencies...\n")
+    sys.stderr.flush()
     deps = {"docx": "python-docx", "PIL": "Pillow", "openpyxl": "openpyxl"}
     for imp, pip_name in deps.items():
+        t1 = time.time()
+        sys.stderr.write(f"[setup]   checking {imp} ({pip_name})...\n")
+        sys.stderr.flush()
         try:
             __import__(imp)
             results.append(f"  [ok] {pip_name}")
+            sys.stderr.write(f"[setup]   {imp} OK ({time.time()-t1:.2f}s)\n")
+            sys.stderr.flush()
         except ImportError:
             results.append(f"  [installing] {pip_name}...")
+            sys.stderr.write(f"[setup]   {imp} not found, calling _ensure_pkg...\n")
+            sys.stderr.flush()
             if _ensure_pkg(imp, pip_name):
                 results.append(f"  [ok] {pip_name} installed")
+                sys.stderr.write(f"[setup]   {imp} installed OK ({time.time()-t1:.2f}s)\n")
+                sys.stderr.flush()
             else:
                 results.append(f"  [FAIL] {pip_name}")
                 all_ok = False
+                sys.stderr.write(f"[setup]   {imp} FAILED ({time.time()-t1:.2f}s)\n")
+                sys.stderr.flush()
+
+    sys.stderr.write(f"[setup] Phase 1 done ({time.time()-t0:.2f}s)\n")
+    sys.stderr.flush()
 
     # 2. Ensure working directories exist
+    sys.stderr.write(f"[setup] Phase 2: checking directories...\n")
+    sys.stderr.flush()
     workspace = _workspace()
     dirs_to_check = {
         "doc": os.path.join(workspace, "doc"),
@@ -1346,14 +1383,24 @@ def handle_setup_environment(args):
                 results.append(f"  [FAIL] {label}/ — {e}")
                 all_ok = False
 
+    sys.stderr.write(f"[setup] Phase 2 done ({time.time()-t0:.2f}s)\n")
+    sys.stderr.flush()
+
     # 3. Check for cached tasks
+    sys.stderr.write(f"[setup] Phase 3: checking cache...\n")
+    sys.stderr.flush()
     has_cache = False
     cache_info = {}
     existing_state = _load_cache(CACHE_PHASE_STATE)
+    sys.stderr.write(f"[setup]   phase_state loaded: {bool(existing_state)}\n")
+    sys.stderr.flush()
     if existing_state and existing_state.get("phases"):
         has_cache = True
-        # Gather cache details
+        sys.stderr.write(f"[setup]   restoring store from cache...\n")
+        sys.stderr.flush()
         _restore_store_from_cache()
+        sys.stderr.write(f"[setup]   store restored ({time.time()-t0:.2f}s)\n")
+        sys.stderr.flush()
         pending = testcase_store.get("pending_images", [])
         total_imgs = len(pending)
         processed_imgs = sum(1 for p in pending if p["processed"])
@@ -1384,8 +1431,13 @@ def handle_setup_environment(args):
         results.append("  1. 继续上次任务 — 调用 get_workflow_state 恢复进度")
         results.append("  2. 开始新任务 — 调用 clear_cache 清除缓存后开始新的用例生成")
 
+    sys.stderr.write(f"[setup] Phase 3 done ({time.time()-t0:.2f}s)\n")
+    sys.stderr.flush()
+
     results.append("")
     results.append("OK - environment ready" if all_ok else "WARN - some deps failed")
+    sys.stderr.write(f"[setup] === handle_setup_environment END ({time.time()-t0:.2f}s) ===\n")
+    sys.stderr.flush()
     return {
         "content": [{"type": "text", "text": "\n".join(results)}],
         "all_ok": all_ok,
@@ -2562,6 +2614,8 @@ HANDLERS = {
 @mcp_server.list_tools()
 async def list_tools():
     """Return list of available tools."""
+    sys.stderr.write(f"[MCP] list_tools called, returning {len(TOOLS)} tools\n")
+    sys.stderr.flush()
     return [
         Tool(
             name=tool["name"],
@@ -2575,12 +2629,19 @@ async def list_tools():
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict):
     """Handle tool calls."""
+    import time
+    t0 = time.time()
+    sys.stderr.write(f"[MCP] call_tool: {name} called with {list(arguments.keys())}\n")
+    sys.stderr.flush()
+
     handler = HANDLERS.get(name)
     if not handler:
         raise ValueError(f"Unknown tool: {name}")
     
     try:
         result = handler(arguments)
+        sys.stderr.write(f"[MCP] call_tool: {name} completed in {time.time()-t0:.2f}s\n")
+        sys.stderr.flush()
         
         # Convert result to MCP format
         if isinstance(result, dict) and "content" in result:
@@ -2594,7 +2655,7 @@ async def call_tool(name: str, arguments: dict):
             return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
     except Exception:
         tb = traceback.format_exc()
-        sys.stderr.write(f"[MCP] Tool error in {name}: {tb}\n")
+        sys.stderr.write(f"[MCP] Tool error in {name} after {time.time()-t0:.2f}s: {tb}\n")
         sys.stderr.flush()
         raise
 
@@ -2603,9 +2664,14 @@ async def main():
     sys.stderr.write("TestCase Generator MCP Server v7.0 starting...\n")
     sys.stderr.write(f"  Workspace: {_INITIAL_WORKSPACE}\n")
     sys.stderr.write(f"  Python: {sys.version.split()[0]}\n")
+    sys.stderr.write(f"  sys.executable: {sys.executable}\n")
     sys.stderr.flush()
 
+    sys.stderr.write("[MCP] Opening stdio_server...\n")
+    sys.stderr.flush()
     async with stdio_server() as (read_stream, write_stream):
+        sys.stderr.write("[MCP] stdio_server opened, starting mcp_server.run...\n")
+        sys.stderr.flush()
         await mcp_server.run(read_stream, write_stream, mcp_server.create_initialization_options())
 
 
