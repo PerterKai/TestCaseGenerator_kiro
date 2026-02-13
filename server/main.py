@@ -40,30 +40,17 @@ def _check_pkg_installed(pip_name):
         return False
 
 
-def _ensure_pkg(import_name, pip_name):
-    """Install a package if not present. Avoids __import__ to prevent deadlock in MCP stdio."""
+def _ensure_pkg(pip_name):
+    """Install a pip package if not present."""
     if _check_pkg_installed(pip_name):
         return True
-    sys.stderr.write(f"[setup] _ensure_pkg: installing {pip_name}...\n")
-    sys.stderr.flush()
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install", pip_name, "-q"],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE, timeout=60)
-        ok = result.returncode == 0
-        sys.stderr.write(f"[setup] _ensure_pkg: pip install {pip_name} rc={result.returncode}\n")
-        if result.stderr:
-            sys.stderr.write(f"[setup] _ensure_pkg: pip stderr: {result.stderr[:500]}\n")
-        sys.stderr.flush()
-        return ok
-    except subprocess.TimeoutExpired:
-        sys.stderr.write(f"[setup] _ensure_pkg: pip install {pip_name} TIMEOUT (60s)\n")
-        sys.stderr.flush()
-        return False
-    except Exception as e:
-        sys.stderr.write(f"[setup] _ensure_pkg: pip install {pip_name} EXCEPTION: {e}\n")
-        sys.stderr.flush()
+        return result.returncode == 0
+    except Exception:
         return False
 
 # ============================================================
@@ -112,8 +99,7 @@ TMP_DOC_DIR = os.path.join(_INITIAL_WORKSPACE, ".tmp", "doc_mk")
 TMP_PIC_DIR = os.path.join(_INITIAL_WORKSPACE, ".tmp", "picture")
 TMP_CACHE_DIR = os.path.join(_INITIAL_WORKSPACE, ".tmp", "cache")
 
-# No forced session switch — let the system decide naturally.
-# Cross-session resume is still fully supported via .tmp/cache/.
+# Cross-session resume is fully supported via .tmp/cache/.
 
 
 def _update_workspace(directory):
@@ -457,7 +443,7 @@ def _parse_embedded_xlsx(z, xlsx_zip_path):
     Returns markdown string with table content, or empty string on failure.
     """
     try:
-        _ensure_pkg("openpyxl", "openpyxl")
+        _ensure_pkg("openpyxl")
         import openpyxl
         
         xlsx_data = z.read(xlsx_zip_path)
@@ -554,7 +540,6 @@ def _find_images_in_element(elem, rid_to_media):
                     found.append(name)
 
     return found
-
 
 
 def _detect_heading_level(para):
@@ -1335,49 +1320,24 @@ TOOLS = [
 
 
 def handle_setup_environment(args):
-    import time
-    t0 = time.time()
-    sys.stderr.write("[setup] === handle_setup_environment START ===\n")
-    sys.stderr.flush()
-
     results = []
     all_ok = True
     results.append(f"Python {sys.version.split()[0]}")
 
     # 1. Check Python dependencies
-    # Use importlib.metadata to check installation without triggering heavy imports
-    # that can deadlock in MCP stdio's asyncio event loop on first run.
-    sys.stderr.write("[setup] Phase 1: checking dependencies...\n")
-    sys.stderr.flush()
-    deps = {"docx": "python-docx", "PIL": "Pillow", "openpyxl": "openpyxl"}
-    for imp, pip_name in deps.items():
-        t1 = time.time()
-        sys.stderr.write(f"[setup]   checking {pip_name}...\n")
-        sys.stderr.flush()
+    deps = {"python-docx": "python-docx", "Pillow": "Pillow", "openpyxl": "openpyxl"}
+    for pip_name in deps.values():
         if _check_pkg_installed(pip_name):
             results.append(f"  [ok] {pip_name}")
-            sys.stderr.write(f"[setup]   {pip_name} OK ({time.time()-t1:.3f}s)\n")
-            sys.stderr.flush()
         else:
             results.append(f"  [installing] {pip_name}...")
-            sys.stderr.write(f"[setup]   {pip_name} not found, installing...\n")
-            sys.stderr.flush()
-            if _ensure_pkg(imp, pip_name):
+            if _ensure_pkg(pip_name):
                 results.append(f"  [ok] {pip_name} installed")
-                sys.stderr.write(f"[setup]   {pip_name} installed OK ({time.time()-t1:.2f}s)\n")
-                sys.stderr.flush()
             else:
                 results.append(f"  [FAIL] {pip_name}")
                 all_ok = False
-                sys.stderr.write(f"[setup]   {pip_name} FAILED ({time.time()-t1:.2f}s)\n")
-                sys.stderr.flush()
-
-    sys.stderr.write(f"[setup] Phase 1 done ({time.time()-t0:.2f}s)\n")
-    sys.stderr.flush()
 
     # 2. Ensure working directories exist
-    sys.stderr.write(f"[setup] Phase 2: checking directories...\n")
-    sys.stderr.flush()
     workspace = _workspace()
     dirs_to_check = {
         "doc": os.path.join(workspace, "doc"),
@@ -1398,24 +1358,13 @@ def handle_setup_environment(args):
                 results.append(f"  [FAIL] {label}/ — {e}")
                 all_ok = False
 
-    sys.stderr.write(f"[setup] Phase 2 done ({time.time()-t0:.2f}s)\n")
-    sys.stderr.flush()
-
     # 3. Check for cached tasks
-    sys.stderr.write(f"[setup] Phase 3: checking cache...\n")
-    sys.stderr.flush()
     has_cache = False
     cache_info = {}
     existing_state = _load_cache(CACHE_PHASE_STATE)
-    sys.stderr.write(f"[setup]   phase_state loaded: {bool(existing_state)}\n")
-    sys.stderr.flush()
     if existing_state and existing_state.get("phases"):
         has_cache = True
-        sys.stderr.write(f"[setup]   restoring store from cache...\n")
-        sys.stderr.flush()
         _restore_store_from_cache()
-        sys.stderr.write(f"[setup]   store restored ({time.time()-t0:.2f}s)\n")
-        sys.stderr.flush()
         pending = testcase_store.get("pending_images", [])
         total_imgs = len(pending)
         processed_imgs = sum(1 for p in pending if p["processed"])
@@ -1446,21 +1395,14 @@ def handle_setup_environment(args):
         results.append("  1. 继续上次任务 — 调用 get_workflow_state 恢复进度")
         results.append("  2. 开始新任务 — 调用 clear_cache 清除缓存后开始新的用例生成")
 
-    sys.stderr.write(f"[setup] Phase 3 done ({time.time()-t0:.2f}s)\n")
-    sys.stderr.flush()
-
     results.append("")
     results.append("OK - environment ready" if all_ok else "WARN - some deps failed")
-    sys.stderr.write(f"[setup] === handle_setup_environment END ({time.time()-t0:.2f}s) ===\n")
-    sys.stderr.flush()
     return {
         "content": [{"type": "text", "text": "\n".join(results)}],
         "all_ok": all_ok,
         "has_cache": has_cache,
         "cache_info": cache_info,
     }
-
-
 
 
 def handle_clear_cache(args):
@@ -1678,8 +1620,6 @@ IMAGE_ANALYSIS_PROMPT = (
 
 # Marker returned by LLM when image is unreadable
 _UNREADABLE_MARKER = "[UNREADABLE]"
-
-
 
 
 def handle_get_workflow_state(args):
@@ -2330,7 +2270,7 @@ def _get_gui_module_path():
 
 
 def handle_configure_llm_api(args):
-    """Launch GUI for configuring external LLM API. Runs as subprocess to avoid blocking MCP."""
+    """Launch GUI for configuring external LLM API."""
     workspace = _workspace()
     gui_path = _get_gui_module_path()
 
@@ -2338,9 +2278,9 @@ def handle_configure_llm_api(args):
         return {"content": [{"type": "text", "text": f"错误: GUI 模块未找到: {gui_path}"}]}
 
     try:
-        # Run GUI as subprocess so it doesn't block the MCP server
         result = subprocess.run(
             [sys.executable, gui_path, workspace],
+            stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=300,
             encoding='utf-8', errors='replace'
         )
@@ -2468,7 +2408,6 @@ def _write_image_result_to_md(img_info, analysis, skipped=False):
         return True, "占位符未找到，已标记为已处理"
     except Exception as e:
         return False, f"写入失败: {e}"
-
 
 
 def handle_process_images_with_llm(args):
