@@ -3,7 +3,7 @@
     "testcase-generator": {
       "command": "python",
       "args": [
-        "server/main.py"
+        "${powerDir}/server/main.py"
       ],
       "env": {
         "PYTHONIOENCODING": "utf-8"
