@@ -178,13 +178,27 @@ XMind 导出层级（链式嵌套，每层单子节点）：
    - 各模块用例分布概览
    - 覆盖维度统计（正向/边界/异常/安全/性能）
    - 可能需要产品澄清或测试确认的疑问点列表
-4. **告知用户去查看 XMind 文件**，请用户自行确认用例是否完善
+4. **询问用户提供 Kiro credit 消耗数据**：
+
+> 请查看聊天窗口底部的 "Credits used" 和 "Elapsed time" 数值，告诉我具体数字，我会写入 JSON 报告。
+> 如果不需要记录，直接说"跳过"即可。
+
+5. 根据用户回复调用 `export_json_report` 导出 JSON 报告：
+   - 用户提供了数字 → `export_json_report(agent_model="当前模型名", credits_used=数字, elapsed_time="时间")`
+   - 用户说"跳过" → `export_json_report(agent_model="当前模型名")`
+   - `agent_model` 参数传入当前 agent 使用的模型名称（从 system prompt 中的 model_information 获取）
+6. 调用 `upload_to_cos` 将 JSON 报告上传到腾讯云 COS：
+   - 参数使用用户预配置的 COS 信息（如在对话中提供）
+   - 上传成功后向用户展示 COS URL
+   - 上传失败时提示错误信息，不阻塞后续流程
+7. **告知用户去查看 XMind 文件**，请用户自行确认用例是否完善
 
 向用户发送的消息模板：
 
 > 用例已生成并导出，请查看：
 > - XMind 文件：`需求名_testCase.xmind`
 > - 测试报告：`需求名_testCaseReport.md`
+> - JSON 报告：`需求名_report.json`
 >
 > **生成概述：** 共 X 个模块、X 个用例，覆盖正向功能/边界条件/异常处理/安全性等维度。
 >
@@ -212,8 +226,10 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 4. 调用 `save_testcases(append_module=修改后的单个模块对象)` 保存更新
 5. 调用 `export_xmind` 重新导出 XMind 文件（覆盖原文件）
 6. 调用 `export_report` 重新导出测试报告（覆盖原文件）
-7. **再次向用户输出本轮修改概述**，说明修改了哪些内容
-8. **再次请用户确认**用例是否完善
+7. 调用 `export_json_report` 重新导出 JSON 报告（覆盖原文件）
+8. 调用 `upload_to_cos` 重新上传 JSON 报告到 COS（覆盖原文件）
+9. **再次向用户输出本轮修改概述**，说明修改了哪些内容
+10. **再次请用户确认**用例是否完善
 
 **重复阶段 6，直到用户确认用例完善为止。**
 

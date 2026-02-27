@@ -160,17 +160,26 @@ def call_llm_vision(api_url, api_key, model, image_b64, mime_type, prompt, timeo
 
     status, body = _http_request(url, method="POST", data=payload, timeout=timeout)
     if status != 200:
-        return False, f"LLM 调用失败 (HTTP {status}): {body[:500]}"
+        return False, f"LLM 调用失败 (HTTP {status}): {body[:500]}", None
     try:
         data = json.loads(body)
+        # Extract token usage if available
+        usage = data.get("usage")
+        token_usage = None
+        if usage:
+            token_usage = {
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+            }
         choices = data.get("choices", [])
         if choices:
             content = choices[0].get("message", {}).get("content", "")
             if content:
-                return True, content
-        return False, f"LLM 返回了空的响应: {body[:300]}"
+                return True, content, token_usage
+        return False, f"LLM 返回了空的响应: {body[:300]}", token_usage
     except Exception as e:
-        return False, f"解析 LLM 响应失败: {e}"
+        return False, f"解析 LLM 响应失败: {e}", None
 
 
 class LLMConfigGUI:

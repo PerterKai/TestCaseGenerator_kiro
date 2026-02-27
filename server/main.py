@@ -1297,6 +1297,21 @@ TOOLS = [
         }
     },
     {
+        "name": "export_json_report",
+        "description": "导出 JSON 格式的用例生成报告，包含文档信息、图片处理统计、外部LLM token消耗、用例统计、覆盖维度等数据。支持传入 agent 模型名称和用户提供的 Kiro credit 消耗。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "requirement_name": {"type": "string", "description": "Requirement name for file naming (auto-detected if not provided)"},
+                "output_dir": {"type": "string", "description": "Output directory (default: workspace root)"},
+                "agent_model": {"type": "string", "description": "Agent model name (e.g. Claude Opus 4.6), reported by agent"},
+                "credits_used": {"type": "number", "description": "Kiro credits consumed, manually provided by user"},
+                "elapsed_time": {"type": "string", "description": "Elapsed time string, manually provided by user (e.g. '1m 45s')"}
+            },
+            "required": []
+        }
+    },
+    {
         "name": "configure_llm_api",
         "description": "打开GUI窗口配置外部多模态LLM API，用于图片解析。支持配置API地址、API Key、测试连接、获取模型列表、选择模型、多线程设置。配置会自动保存，下次打开时恢复上次输入。用户选择'图片+文本解析'模式时调用此工具。",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
@@ -1310,6 +1325,22 @@ TOOLS = [
                 "force_reprocess": {"type": "boolean", "description": "强制重新处理已处理的图片 (default: false)"}
             },
             "required": []
+        }
+    },
+    {
+        "name": "upload_to_cos",
+        "description": "将指定文件上传到腾讯云COS。默认上传 report.json，也可指定其他文件。上传路径前缀由 cos_strategy_prefix 控制。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "要上传的文件路径（绝对路径或相对于工作区的路径）。如不指定，自动查找最新的 *_report.json"},
+                "cos_secret_id": {"type": "string", "description": "COS SecretId"},
+                "cos_secret_key": {"type": "string", "description": "COS SecretKey"},
+                "cos_region": {"type": "string", "description": "COS Region (e.g. ap-guangzhou)"},
+                "cos_bucket": {"type": "string", "description": "COS Bucket (e.g. my-bucket-1250000000)"},
+                "cos_strategy_prefix": {"type": "string", "description": "COS 上传路径前缀 (e.g. Testcase_reports/)"}
+            },
+            "required": ["cos_secret_id", "cos_secret_key", "cos_region", "cos_bucket"]
         }
     }
 ]
@@ -1531,7 +1562,9 @@ def handle_parse_documents(args):
                 f.write(md_text)
             all_md_files.append({
                 "name": md_filename, "path": md_path,
-                "role": doc_role, "tag": doc_tag
+                "role": doc_role, "tag": doc_tag,
+                "source_filename": os.path.basename(fpath),
+                "file_size_bytes": os.path.getsize(fpath),
             })
 
             # Only extract images for primary documents
@@ -2259,6 +2292,242 @@ def handle_export_xmind(args):
     except Exception as e:
         return {"content": [{"type": "text", "text": f"Export failed: {e}"}]}
 
+
+def handle_export_json_report(args):
+    """Export a JSON report with all available metrics from the test case generation run."""
+    import datetime
+
+    if not testcase_store["modules"]:
+        _restore_store_from_cache()
+    modules = testcase_store["modules"]
+
+    req_name = args.get("requirement_name") or _get_requirement_name()
+    output_dir = args.get("output_dir", _workspace())
+    agent_model = args.get("agent_model", "")
+    credits_used = args.get("credits_used")
+    elapsed_time = args.get("elapsed_time", "")
+
+    # --- agent_info ---
+    agent_info = {"platform": "Kiro"}
+    if agent_model:
+        agent_info["model_name"] = agent_model
+    if credits_used is not None:
+        agent_info["credits_used"] = credits_used
+    if elapsed_time:
+        agent_info["elapsed_time"] = elapsed_time
+
+    # --- documents ---
+    md_files = testcase_store.get("md_files", [])
+    if not md_files:
+        _restore_store_from_cache()
+        md_files = testcase_store.get("md_files", [])
+
+    doc_files = []
+    primary_count = 0
+    reference_count = 0
+    for mf in md_files:
+        role = mf.get("role", "primary")
+        if role == "primary":
+            primary_count += 1
+        else:
+            reference_count += 1
+        doc_files.append({
+            "filename": mf.get("source_filename", mf.get("name", "")),
+            "role": role,
+            "tag": mf.get("tag"),
+            "file_size_bytes": mf.get("file_size_bytes", 0),
+            "md_filename": mf.get("name", ""),
+        })
+
+    documents = {
+        "total_count": len(md_files),
+        "primary_count": primary_count,
+        "reference_count": reference_count,
+        "files": doc_files,
+    }
+
+    # --- image_processing ---
+    phase_state = _load_cache(CACHE_PHASE_STATE, {})
+    img_phase = phase_state.get("phases", {}).get("image_analysis", {})
+
+    # Load LLM config
+    llm_config_info = {}
+    try:
+        gui_dir = os.path.dirname(os.path.abspath(__file__))
+        if gui_dir not in sys.path:
+            sys.path.insert(0, gui_dir)
+        from gui_llm_config import load_config as load_llm_config
+        config = load_llm_config(_workspace())
+        llm_config_info = {
+            "api_url": config.get("api_url", ""),
+            "model": config.get("model", ""),
+            "multithreading": config.get("enable_multithreading", False),
+            "max_threads": config.get("max_threads", 3),
+        }
+    except Exception:
+        pass
+
+    total_images = img_phase.get("total", 0)
+    processed_images = img_phase.get("processed", 0)
+    skipped_images = img_phase.get("skipped", 0)
+    token_usage_data = img_phase.get("token_usage", {})
+
+    image_processing = {
+        "total_images": total_images,
+        "processed": processed_images,
+        "skipped": skipped_images,
+        "failed": max(0, total_images - processed_images),
+    }
+    if llm_config_info:
+        image_processing["llm_config"] = llm_config_info
+    if token_usage_data and any(v > 0 for v in token_usage_data.values()):
+        tp = token_usage_data.get("total_tokens", 0)
+        image_processing["token_usage"] = {
+            "total_prompt_tokens": token_usage_data.get("prompt_tokens", 0),
+            "total_completion_tokens": token_usage_data.get("completion_tokens", 0),
+            "total_tokens": tp,
+            "per_image_avg_tokens": round(tp / processed_images) if processed_images > 0 else 0,
+        }
+
+    # --- testcase_summary ---
+    total_cases = sum(len(s.get("test_cases", []))
+                      for m in modules for s in m.get("sub_modules", []))
+    total_subs = sum(len(m.get("sub_modules", [])) for m in modules)
+
+    module_list = []
+    for m in modules:
+        subs = m.get("sub_modules", [])
+        mc = sum(len(s.get("test_cases", [])) for s in subs)
+        module_list.append({
+            "name": m["name"],
+            "sub_module_count": len(subs),
+            "case_count": mc,
+        })
+
+    # Coverage dimensions
+    all_dims = dict.fromkeys(_COVERAGE_DIMS, 0)
+    for m in modules:
+        for s in m.get("sub_modules", []):
+            for c in s.get("test_cases", []):
+                for dim in _classify_case_dimensions(c):
+                    all_dims[dim] += 1
+
+    coverage = {}
+    for dim, count in sorted(all_dims.items(), key=lambda x: -x[1]):
+        pct = f"{count / total_cases * 100:.1f}%" if total_cases > 0 else "0%"
+        coverage[dim] = {"count": count, "percentage": pct}
+
+    testcase_summary = {
+        "requirement_name": req_name,
+        "module_count": len(modules),
+        "sub_module_count": total_subs,
+        "total_cases": total_cases,
+        "modules": module_list,
+        "coverage_dimensions": coverage,
+    }
+
+    # --- assemble report ---
+    report = {
+        "report_version": "1.0",
+        "generated_at": datetime.datetime.now().isoformat(timespec='seconds'),
+        "agent_info": agent_info,
+        "documents": documents,
+        "image_processing": image_processing,
+        "testcase_summary": testcase_summary,
+    }
+
+    report_filename = f"{req_name}_report.json"
+    report_path = os.path.join(output_dir, report_filename)
+
+    try:
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        return {
+            "content": [{"type": "text", "text": f"✓ JSON 报告已生成: {report_path}"}],
+            "report_path": report_path,
+            "report_filename": report_filename,
+        }
+    except Exception as e:
+        return {"content": [{"type": "text", "text": f"JSON 报告生成失败: {e}"}]}
+
+
+# ============================================================
+# COS Upload Handler
+# ============================================================
+
+def handle_upload_to_cos(args):
+    """Upload a file to Tencent Cloud COS."""
+    # Ensure cos sdk is installed
+    if not _ensure_pkg("cos-python-sdk-v5"):
+        return {"content": [{"type": "text", "text": "错误: 无法安装 cos-python-sdk-v5，请手动执行 pip install cos-python-sdk-v5"}]}
+
+    from qcloud_cos import CosConfig, CosS3Client
+
+    secret_id = args.get("cos_secret_id", "")
+    secret_key = args.get("cos_secret_key", "")
+    region = args.get("cos_region", "")
+    bucket = args.get("cos_bucket", "")
+    prefix = args.get("cos_strategy_prefix", "")
+    file_path = args.get("file_path", "")
+
+    if not all([secret_id, secret_key, region, bucket]):
+        return {"content": [{"type": "text", "text": "错误: 缺少 COS 必要参数 (cos_secret_id, cos_secret_key, cos_region, cos_bucket)"}]}
+
+    # Auto-detect report.json if file_path not specified
+    if not file_path:
+        workspace = _workspace()
+        candidates = glob.glob(os.path.join(workspace, "*_report.json"))
+        if not candidates:
+            return {"content": [{"type": "text", "text": "错误: 未找到 *_report.json 文件，请先调用 export_json_report 生成报告"}]}
+        file_path = max(candidates, key=os.path.getmtime)
+
+    # Resolve relative path
+    if not os.path.isabs(file_path):
+        file_path = os.path.join(_workspace(), file_path)
+
+    if not os.path.exists(file_path):
+        return {"content": [{"type": "text", "text": f"错误: 文件不存在: {file_path}"}]}
+
+    filename = os.path.basename(file_path)
+    cos_key = f"{prefix}{filename}" if prefix else filename
+
+    try:
+        config = CosConfig(
+            Region=region,
+            SecretId=secret_id,
+            SecretKey=secret_key,
+        )
+        client = CosS3Client(config)
+
+        with open(file_path, 'rb') as fp:
+            response = client.put_object(
+                Bucket=bucket,
+                Body=fp,
+                Key=cos_key,
+                ContentType='application/json',
+            )
+
+        etag = response.get('ETag', '')
+        cos_url = f"https://{bucket}.cos.{region}.myqcloud.com/{cos_key}"
+
+        return {
+            "content": [{"type": "text", "text": (
+                f"✓ 文件已上传到 COS\n"
+                f"  Bucket: {bucket}\n"
+                f"  Key: {cos_key}\n"
+                f"  ETag: {etag}\n"
+                f"  URL: {cos_url}"
+            )}],
+            "cos_url": cos_url,
+            "cos_key": cos_key,
+        }
+    except Exception as e:
+        tb = traceback.format_exc()
+        sys.stderr.write(f"[MCP] COS upload error: {tb}\n")
+        sys.stderr.flush()
+        return {"content": [{"type": "text", "text": f"COS 上传失败: {e}"}]}
+
+
 # ============================================================
 # ============================================================
 # External LLM Image Processing Handlers
@@ -2347,19 +2616,19 @@ def _process_single_image(img_info, api_url, api_key, model, prompt):
             sys.path.insert(0, gui_dir)
         from gui_llm_config import call_llm_vision
 
-        ok, result = call_llm_vision(api_url, api_key, model, b64, mime, prompt, timeout=120)
+        ok, result, token_usage = call_llm_vision(api_url, api_key, model, b64, mime, prompt, timeout=120)
         if not ok:
-            return img_id, 'error', result
+            return img_id, 'error', result, token_usage
 
         # Check if LLM reported the image as unreadable
         result_stripped = result.strip()
         if result_stripped.startswith(_UNREADABLE_MARKER):
             reason = result_stripped[len(_UNREADABLE_MARKER):].strip()
-            return img_id, 'skipped', reason or "图片清晰度不足，无法准确解析"
+            return img_id, 'skipped', reason or "图片清晰度不足，无法准确解析", token_usage
 
-        return img_id, 'ok', result
+        return img_id, 'ok', result, token_usage
     except Exception as e:
-        return img_id, 'error', f"处理异常: {e}"
+        return img_id, 'error', f"处理异常: {e}", None
 
 
 # Lock for thread-safe markdown file writes (used by multi-threaded LLM processing)
@@ -2450,6 +2719,10 @@ def handle_process_images_with_llm(args):
     success_count = 0
     fail_count = 0
     skip_count = 0
+    # Token usage accumulator
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_all_tokens = 0
 
     if enable_mt and len(to_process) > 1:
         # Multi-threaded processing
@@ -2466,7 +2739,11 @@ def handle_process_images_with_llm(args):
             for future in concurrent.futures.as_completed(future_to_img):
                 img = future_to_img[future]
                 try:
-                    img_id, status, result_text = future.result()
+                    img_id, status, result_text, token_usage = future.result()
+                    if token_usage:
+                        total_prompt_tokens += token_usage.get("prompt_tokens", 0)
+                        total_completion_tokens += token_usage.get("completion_tokens", 0)
+                        total_all_tokens += token_usage.get("total_tokens", 0)
                     if status == 'ok':
                         wrote_ok, write_msg = _write_image_result_to_md(img, result_text)
                         img["processed"] = True
@@ -2492,7 +2769,11 @@ def handle_process_images_with_llm(args):
         results_log.append(f"📝 顺序处理 {len(to_process)} 张图片\n")
         for i, img in enumerate(to_process, 1):
             results_log.append(f"  [{i}/{len(to_process)}] 处理 {img['id']} ...")
-            img_id, status, result_text = _process_single_image(img, api_url, api_key, model, prompt)
+            img_id, status, result_text, token_usage = _process_single_image(img, api_url, api_key, model, prompt)
+            if token_usage:
+                total_prompt_tokens += token_usage.get("prompt_tokens", 0)
+                total_completion_tokens += token_usage.get("completion_tokens", 0)
+                total_all_tokens += token_usage.get("total_tokens", 0)
             if status == 'ok':
                 wrote_ok, write_msg = _write_image_result_to_md(img, result_text)
                 img["processed"] = True
@@ -2520,6 +2801,11 @@ def handle_process_images_with_llm(args):
         "total": total,
         "processed": processed,
         "skipped": skipped_total,
+        "token_usage": {
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": total_all_tokens,
+        },
     })
 
     results_log.append(f"\n处理完成: {success_count} 成功, {skip_count} 跳过(不清晰), {fail_count} 失败, 总进度 {processed}/{total}")
@@ -2557,6 +2843,8 @@ HANDLERS = {
     "export_xmind": handle_export_xmind,
     "review_module_structure": handle_review_module_structure,
     "export_report": handle_export_report,
+    "export_json_report": handle_export_json_report,
+    "upload_to_cos": handle_upload_to_cos,
     "configure_llm_api": handle_configure_llm_api,
     "process_images_with_llm": handle_process_images_with_llm,
 }
