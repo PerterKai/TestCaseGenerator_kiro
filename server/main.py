@@ -1342,6 +1342,18 @@ TOOLS = [
             },
             "required": ["cos_secret_id", "cos_secret_key", "cos_region", "cos_bucket"]
         }
+    },
+    {
+        "name": "record_iteration_feedback",
+        "description": "记录用户在用例迭代阶段的反馈原话。每次用户提出修改意见时调用，将用户原话追加到缓存中，最终写入 JSON 报告的 iteration_feedbacks 字段。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "user_message": {"type": "string", "description": "用户本轮迭代的原始反馈内容"},
+                "iteration": {"type": "integer", "description": "当前迭代轮次（与 export_xmind 的 iteration_count 对应）"}
+            },
+            "required": ["user_message"]
+        }
     }
 ]
 
@@ -1441,7 +1453,7 @@ def handle_clear_cache(args):
     cleared = []
 
     # Clear cache files
-    for cache_file in (CACHE_PHASE_STATE, CACHE_IMAGE_PROGRESS, CACHE_TESTCASES, CACHE_DOC_SUMMARY):
+    for cache_file in (CACHE_PHASE_STATE, CACHE_IMAGE_PROGRESS, CACHE_TESTCASES, CACHE_DOC_SUMMARY, CACHE_ITERATION_FEEDBACKS):
         cache_fp = _cache_path(cache_file)
         if os.path.exists(cache_fp):
             os.remove(cache_fp)
@@ -2286,9 +2298,16 @@ def handle_export_xmind(args):
         create_xmind_file(testcase_store["modules"], p)
         total = sum(len(s.get("test_cases", [])) for m in testcase_store["modules"]
                     for s in m.get("sub_modules", []))
+
+        # Increment iteration counter (each xmind export = one iteration)
+        phase_state = _load_cache(CACHE_PHASE_STATE, {})
+        iteration_count = phase_state.get("iteration_count", 0) + 1
+        phase_state["iteration_count"] = iteration_count
+        _save_cache(CACHE_PHASE_STATE, phase_state)
+
         _save_phase_state("export", "completed")
-        return {"content": [{"type": "text", "text": f"Exported: {p}\n{len(testcase_store['modules'])} modules, {total} cases"}],
-                "xmind_path": p, "requirement_name": req_name}
+        return {"content": [{"type": "text", "text": f"Exported: {p}\n{len(testcase_store['modules'])} modules, {total} cases\nIteration: {iteration_count}"}],
+                "xmind_path": p, "requirement_name": req_name, "iteration_count": iteration_count}
     except Exception as e:
         return {"content": [{"type": "text", "text": f"Export failed: {e}"}]}
 
@@ -2306,6 +2325,17 @@ def handle_export_json_report(args):
     agent_model = args.get("agent_model", "")
     credits_used = args.get("credits_used")
     elapsed_time = args.get("elapsed_time", "")
+
+    # --- report_id: reuse existing timestamp or generate new one ---
+    phase_state = _load_cache(CACHE_PHASE_STATE, {})
+    report_ts = phase_state.get("report_timestamp")
+    if not report_ts:
+        report_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        phase_state["report_timestamp"] = report_ts
+        _save_cache(CACHE_PHASE_STATE, phase_state)
+
+    # --- iteration_count ---
+    iteration_count = phase_state.get("iteration_count", 1)
 
     # --- agent_info ---
     agent_info = {"platform": "Kiro"}
@@ -2427,23 +2457,29 @@ def handle_export_json_report(args):
     }
 
     # --- assemble report ---
+    # Load iteration feedbacks from cache
+    iteration_feedbacks = _load_cache(CACHE_ITERATION_FEEDBACKS, [])
+
     report = {
-        "report_version": "1.0",
+        "report_version": "1.1",
+        "report_id": f"{req_name}_{report_ts}",
         "generated_at": datetime.datetime.now().isoformat(timespec='seconds'),
+        "iteration_count": iteration_count,
+        "iteration_feedbacks": iteration_feedbacks,
         "agent_info": agent_info,
         "documents": documents,
         "image_processing": image_processing,
         "testcase_summary": testcase_summary,
     }
 
-    report_filename = f"{req_name}_report.json"
+    report_filename = f"{req_name}_report_{report_ts}.json"
     report_path = os.path.join(output_dir, report_filename)
 
     try:
         with open(report_path, 'w', encoding='utf-8') as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
         return {
-            "content": [{"type": "text", "text": f"✓ JSON 报告已生成: {report_path}"}],
+            "content": [{"type": "text", "text": f"✓ JSON 报告已生成: {report_path}\n  report_id: {req_name}_{report_ts}\n  iteration_count: {iteration_count}"}],
             "report_path": report_path,
             "report_filename": report_filename,
         }
@@ -2476,9 +2512,12 @@ def handle_upload_to_cos(args):
     # Auto-detect report.json if file_path not specified
     if not file_path:
         workspace = _workspace()
-        candidates = glob.glob(os.path.join(workspace, "*_report.json"))
+        candidates = glob.glob(os.path.join(workspace, "*_report_*.json"))
         if not candidates:
-            return {"content": [{"type": "text", "text": "错误: 未找到 *_report.json 文件，请先调用 export_json_report 生成报告"}]}
+            # Fallback to old naming pattern
+            candidates = glob.glob(os.path.join(workspace, "*_report.json"))
+        if not candidates:
+            return {"content": [{"type": "text", "text": "错误: 未找到 *_report*.json 文件，请先调用 export_json_report 生成报告"}]}
         file_path = max(candidates, key=os.path.getmtime)
 
     # Resolve relative path
@@ -2511,13 +2550,7 @@ def handle_upload_to_cos(args):
         cos_url = f"https://{bucket}.cos.{region}.myqcloud.com/{cos_key}"
 
         return {
-            "content": [{"type": "text", "text": (
-                f"✓ 文件已上传到 COS\n"
-                f"  Bucket: {bucket}\n"
-                f"  Key: {cos_key}\n"
-                f"  ETag: {etag}\n"
-                f"  URL: {cos_url}"
-            )}],
+            "content": [{"type": "text", "text": f"✓ 文件已上传到 COS: {cos_url}"}],
             "cos_url": cos_url,
             "cos_key": cos_key,
         }
@@ -2526,6 +2559,33 @@ def handle_upload_to_cos(args):
         sys.stderr.write(f"[MCP] COS upload error: {tb}\n")
         sys.stderr.flush()
         return {"content": [{"type": "text", "text": f"COS 上传失败: {e}"}]}
+
+
+# ============================================================
+# Iteration Feedback Recorder
+# ============================================================
+
+CACHE_ITERATION_FEEDBACKS = "iteration_feedbacks.json"
+
+def handle_record_iteration_feedback(args):
+    """Record user feedback message for a given iteration round."""
+    import datetime
+    user_message = args.get("user_message", "").strip()
+    if not user_message:
+        return {"content": [{"type": "text", "text": "错误: user_message 不能为空"}]}
+
+    phase_state = _load_cache(CACHE_PHASE_STATE, {})
+    iteration = args.get("iteration") or phase_state.get("iteration_count", 1)
+
+    feedbacks = _load_cache(CACHE_ITERATION_FEEDBACKS, [])
+    feedbacks.append({
+        "iteration": iteration,
+        "timestamp": datetime.datetime.now().isoformat(timespec='seconds'),
+        "user_message": user_message,
+    })
+    _save_cache(CACHE_ITERATION_FEEDBACKS, feedbacks)
+
+    return {"content": [{"type": "text", "text": f"✓ 已记录第 {iteration} 轮迭代反馈（共 {len(feedbacks)} 条）"}]}
 
 
 # ============================================================
@@ -2845,6 +2905,7 @@ HANDLERS = {
     "export_report": handle_export_report,
     "export_json_report": handle_export_json_report,
     "upload_to_cos": handle_upload_to_cos,
+    "record_iteration_feedback": handle_record_iteration_feedback,
     "configure_llm_api": handle_configure_llm_api,
     "process_images_with_llm": handle_process_images_with_llm,
 }

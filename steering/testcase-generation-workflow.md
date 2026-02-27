@@ -173,32 +173,42 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 2. 调用 `export_report(questions=[...])` 导出测试报告（自动命名为 `需求名_testCaseReport.md`）
    - `questions` 参数传入 Review 过程中发现的需求疑问点列表
    - 报告包含：模块概览、覆盖维度统计、需求疑问点
-3. **向用户输出用例生成概述**，内容包括：
+3. 调用 `export_json_report(agent_model="当前模型名")` 导出 JSON 报告
+   - 文件名自动带时间戳：`需求名_report_20260227_143052.json`
+   - 同一任务多次导出复用同一时间戳，确保 COS 上覆盖同一文件
+   - `agent_model` 参数传入当前 agent 使用的模型名称（从 system prompt 中的 model_information 获取）
+   - 此时不含 credit 信息，后续用户提供后覆盖更新
+4. 调用 `upload_to_cos` 将 JSON 报告上传到腾讯云 COS
+   - 使用以下固定配置参数：
+     - `cos_secret_id`: `AKIDqY5ZqwqY3KSN5bw65qNjspa8TdcOwGPK`
+     - `cos_secret_key`: `rVwGRPAj9ORHtJZcYGm7HDxWr0ve9Rj3`
+     - `cos_region`: `ap-guangzhou`
+     - `cos_bucket`: `stock-report-bucket-1385219702`
+     - `cos_strategy_prefix`: `Testcase_reports/`
+   - 上传成功后向用户展示 COS URL
+   - 上传失败时提示错误信息，不阻塞后续流程
+5. **向用户输出用例生成概述**，内容包括：
    - 用例生成情况总结：共生成 X 个模块、X 个子模块、X 个用例
    - 各模块用例分布概览
    - 覆盖维度统计（正向/边界/异常/安全/性能）
    - 可能需要产品澄清或测试确认的疑问点列表
-4. **询问用户提供 Kiro credit 消耗数据**：
+6. **询问用户提供 Kiro credit 消耗数据**：
 
-> 请查看聊天窗口底部的 "Credits used" 和 "Elapsed time" 数值，告诉我具体数字，我会写入 JSON 报告。
+> 请查看聊天窗口底部的 "Credits used" 和 "Elapsed time" 数值，告诉我具体数字，我会写入 JSON 报告并重新上传。
 > 如果不需要记录，直接说"跳过"即可。
 
-5. 根据用户回复调用 `export_json_report` 导出 JSON 报告：
-   - 用户提供了数字 → `export_json_report(agent_model="当前模型名", credits_used=数字, elapsed_time="时间")`
-   - 用户说"跳过" → `export_json_report(agent_model="当前模型名")`
-   - `agent_model` 参数传入当前 agent 使用的模型名称（从 system prompt 中的 model_information 获取）
-6. 调用 `upload_to_cos` 将 JSON 报告上传到腾讯云 COS：
-   - 参数使用用户预配置的 COS 信息（如在对话中提供）
-   - 上传成功后向用户展示 COS URL
-   - 上传失败时提示错误信息，不阻塞后续流程
-7. **告知用户去查看 XMind 文件**，请用户自行确认用例是否完善
+7. 如果用户提供了 credit 数据：
+   - 调用 `export_json_report(agent_model="当前模型名", credits_used=数字, elapsed_time="时间")` 覆盖更新 JSON 报告
+   - 调用 `upload_to_cos` 重新上传（使用阶段5中的固定 COS 配置参数，同一文件名覆盖）
+   - 如果用户说"跳过"，则不再更新，继续后续流程
+8. **告知用户去查看 XMind 文件**，请用户自行确认用例是否完善
 
 向用户发送的消息模板：
 
 > 用例已生成并导出，请查看：
 > - XMind 文件：`需求名_testCase.xmind`
 > - 测试报告：`需求名_testCaseReport.md`
-> - JSON 报告：`需求名_report.json`
+> - JSON 报告：`需求名_report_时间戳.json`（已上传 COS）
 >
 > **生成概述：** 共 X 个模块、X 个用例，覆盖正向功能/边界条件/异常处理/安全性等维度。
 >
@@ -220,16 +230,19 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 
 #### 6.2 用户反馈需要补充/修改 → 迭代更新
 如果用户提出修改意见（如遗漏场景、用例不准确、需要补充等）：
-1. 根据用户反馈，定位需要修改的模块
-2. 如需回顾文档内容，调用 `get_doc_section` 重新读取相关章节
-3. 修改或补充对应模块的用例
-4. 调用 `save_testcases(append_module=修改后的单个模块对象)` 保存更新
-5. 调用 `export_xmind` 重新导出 XMind 文件（覆盖原文件）
-6. 调用 `export_report` 重新导出测试报告（覆盖原文件）
-7. 调用 `export_json_report` 重新导出 JSON 报告（覆盖原文件）
-8. 调用 `upload_to_cos` 重新上传 JSON 报告到 COS（覆盖原文件）
-9. **再次向用户输出本轮修改概述**，说明修改了哪些内容
-10. **再次请用户确认**用例是否完善
+1. 调用 `record_iteration_feedback(user_message="用户原话")` 记录本轮用户反馈
+2. 根据用户反馈，定位需要修改的模块
+3. 如需回顾文档内容，调用 `get_doc_section` 重新读取相关章节
+4. 修改或补充对应模块的用例
+5. 调用 `save_testcases(append_module=修改后的单个模块对象)` 保存更新
+6. 调用 `export_xmind` 重新导出 XMind 文件（覆盖原文件，迭代计数自动+1）
+7. 调用 `export_report` 重新导出测试报告（覆盖原文件）
+8. 调用 `export_json_report` 重新导出 JSON 报告（同一时间戳文件名，迭代次数和反馈记录自动更新）
+9. 调用 `upload_to_cos` 重新上传 JSON 报告到 COS（使用阶段5中的固定 COS 配置参数，覆盖同一文件）
+10. **再次向用户输出本轮修改概述**，说明修改了哪些内容
+11. **如果用户尚未提供 credit 数据，再次提醒**：
+    > 请查看聊天窗口底部的 "Credits used" 和 "Elapsed time"，告诉我数字我会更新报告。
+12. **再次请用户确认**用例是否完善
 
 **重复阶段 6，直到用户确认用例完善为止。**
 
