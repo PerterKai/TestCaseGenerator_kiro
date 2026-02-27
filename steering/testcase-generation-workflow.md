@@ -168,17 +168,18 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 5. **在 Review 过程中，记录发现的需求疑问点和确认项**，用于最终报告
 
 ### 阶段5: 首次导出 + 用例概述
-自动 Review 完成后：
-1. 调用 `export_xmind` 导出 XMind 文件（自动命名为 `需求名_testCase.xmind`）
-2. 调用 `export_report(questions=[...])` 导出测试报告（自动命名为 `需求名_testCaseReport.md`）
+自动 Review 完成后，按以下顺序导出（report.json 和 COS 上传在 XMind 之前）：
+
+1. 调用 `export_report(questions=[...])` 导出测试报告（自动命名为 `需求名_testCaseReport.md`）
    - `questions` 参数传入 Review 过程中发现的需求疑问点列表
    - 报告包含：模块概览、覆盖维度统计、需求疑问点
-3. 调用 `export_json_report(agent_model="当前模型名")` 导出 JSON 报告
+2. 调用 `export_json_report(agent_model="当前模型名")` 导出 JSON 报告
    - 文件名自动带时间戳：`需求名_report_20260227_143052.json`
    - 同一任务多次导出复用同一时间戳，确保 COS 上覆盖同一文件
    - `agent_model` 参数传入当前 agent 使用的模型名称（从 system prompt 中的 model_information 获取）
    - 此时不含 credit 信息，后续用户提供后覆盖更新
-4. 调用 `upload_to_cos` 将 JSON 报告上传到腾讯云 COS
+   - **记住此次生成的 `report_filename`（如 `需求名_report_20260227_143052.json`），后续所有迭代必须使用同一文件名上传 COS 以实现覆盖**
+3. 调用 `upload_to_cos` 将 JSON 报告上传到腾讯云 COS
    - 使用以下固定配置参数：
      - `cos_secret_id`: `AKIDqY5ZqwqY3KSN5bw65qNjspa8TdcOwGPK`
      - `cos_secret_key`: `rVwGRPAj9ORHtJZcYGm7HDxWr0ve9Rj3`
@@ -187,6 +188,7 @@ XMind 导出层级（链式嵌套，每层单子节点）：
      - `cos_strategy_prefix`: `Testcase_reports/`
    - 上传成功后向用户展示 COS URL
    - 上传失败时提示错误信息，不阻塞后续流程
+4. 调用 `export_xmind` 导出 XMind 文件（自动命名为 `需求名_testCase.xmind`）
 5. **向用户输出用例生成概述**，内容包括：
    - 用例生成情况总结：共生成 X 个模块、X 个子模块、X 个用例
    - 各模块用例分布概览
@@ -231,14 +233,17 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 #### 6.2 用户反馈需要补充/修改 → 迭代更新
 如果用户提出修改意见（如遗漏场景、用例不准确、需要补充等）：
 1. 调用 `record_iteration_feedback(user_message="用户原话")` 记录本轮用户反馈
+   - **用户的原始输入文字会被完整记录，最终写入 JSON 报告的 `iteration_feedbacks` 字段**
 2. 根据用户反馈，定位需要修改的模块
 3. 如需回顾文档内容，调用 `get_doc_section` 重新读取相关章节
 4. 修改或补充对应模块的用例
 5. 调用 `save_testcases(append_module=修改后的单个模块对象)` 保存更新
-6. 调用 `export_xmind` 重新导出 XMind 文件（覆盖原文件，迭代计数自动+1）
-7. 调用 `export_report` 重新导出测试报告（覆盖原文件）
-8. 调用 `export_json_report` 重新导出 JSON 报告（同一时间戳文件名，迭代次数和反馈记录自动更新）
-9. 调用 `upload_to_cos` 重新上传 JSON 报告到 COS（使用阶段5中的固定 COS 配置参数，覆盖同一文件）
+6. 调用 `export_report` 重新导出测试报告（覆盖原文件）
+7. 调用 `export_json_report` 重新导出 JSON 报告（同一时间戳文件名，迭代次数和反馈记录自动更新）
+   - **报告中的 `iteration_feedbacks` 数组包含每一轮迭代用户的完整输入文字**
+8. 调用 `upload_to_cos` 重新上传 JSON 报告到 COS（使用阶段5中的固定 COS 配置参数）
+   - **必须确保上传的文件名与首次上传一致（由 `report_timestamp` 保证），以覆盖 COS 上的同一文件**
+9. 调用 `export_xmind` 重新导出 XMind 文件（覆盖原文件，迭代计数自动+1）
 10. **再次向用户输出本轮修改概述**，说明修改了哪些内容
 11. **如果用户尚未提供 credit 数据，再次提醒**：
     > 请查看聊天窗口底部的 "Credits used" 和 "Elapsed time"，告诉我数字我会更新报告。
@@ -252,9 +257,11 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 - 新任务开始前，必须确认文档已就位
 - 新任务开始前，必须让用户选择处理模式（文档+图片 / 纯文档）
 - 对文档内容有疑问时，主动向用户确认，不要自行猜测
-- **自动 Review 完成后，必须先导出 XMind 和报告，然后向用户输出用例概述和疑问点，请用户查看 XMind 确认**
+- **自动 Review 完成后，必须先导出 report.json 并上传 COS，再导出 XMind，然后向用户输出用例概述和疑问点，请用户查看 XMind 确认**
 - **必须等待用户明确确认"用例完善"后才能结束流程，不能自行判断结束**
-- **用户反馈需要修改时，修改用例后必须重新导出 XMind 和报告，再次请用户确认**
+- **用户反馈需要修改时，修改用例后必须重新导出 report.json + 上传 COS + 导出 XMind，再次请用户确认**
+- **每次迭代的 COS 上传文件名必须与首次一致（通过 report_timestamp 机制保证），以实现覆盖**
+- **最终 JSON 报告的 `iteration_feedbacks` 字段包含每次迭代用户的完整输入文字**
 
 ## 跨 session 恢复机制
 
