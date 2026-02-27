@@ -9,6 +9,7 @@ multi-threading toggle, and persistent config.
 import json
 import os
 import sys
+import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
@@ -194,7 +195,7 @@ class LLMConfigGUI:
     def _build_ui(self):
         self.root = tk.Tk()
         self.root.title("外部多模态 LLM API 配置")
-        self.root.geometry("620x580")
+        self.root.geometry("620x420")
         self.root.resizable(False, False)
 
         # Try to center on screen
@@ -211,7 +212,12 @@ class LLMConfigGUI:
         # Title
         title_label = ttk.Label(main_frame, text="配置外部多模态 LLM API 进行图片解析",
                                 font=("", 12, "bold"))
-        title_label.pack(anchor=tk.W, pady=(0, 10))
+        title_label.pack(anchor=tk.W, pady=(0, 5))
+
+        # Info label
+        info_label = ttk.Label(main_frame, text="模型: gpt-4o（固定）  |  并发线程: 8",
+                               font=("", 9))
+        info_label.pack(anchor=tk.W, pady=(0, 10))
 
         # --- API URL ---
         url_frame = ttk.LabelFrame(main_frame, text="API 地址", padding=8)
@@ -237,53 +243,20 @@ class LLMConfigGUI:
                                        command=lambda: key_entry.config(show="" if self.show_key_var.get() else "*"))
         show_key_cb.pack(side=tk.RIGHT)
 
-        # --- Model Selection ---
-        model_frame = ttk.LabelFrame(main_frame, text="模型选择", padding=8)
-        model_frame.pack(fill=tk.X, pady=4)
-
-        model_row = ttk.Frame(model_frame)
-        model_row.pack(fill=tk.X)
-
-        self.model_var = tk.StringVar(value=self.config.get("model", ""))
-        self.model_combo = ttk.Combobox(model_row, textvariable=self.model_var, width=45)
-        saved_models = self.config.get("models_list", [])
-        if saved_models:
-            self.model_combo['values'] = saved_models
-        self.model_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-
-        fetch_btn = ttk.Button(model_row, text="获取模型列表", command=self._on_fetch_models)
-        fetch_btn.pack(side=tk.RIGHT)
-
-        # --- Multi-threading ---
-        thread_frame = ttk.LabelFrame(main_frame, text="多线程设置", padding=8)
-        thread_frame.pack(fill=tk.X, pady=4)
-
-        self.mt_var = tk.BooleanVar(value=self.config.get("enable_multithreading", False))
-        mt_cb = ttk.Checkbutton(thread_frame, text="启用多线程并发处理图片",
-                                 variable=self.mt_var, command=self._on_mt_toggle)
-        mt_cb.pack(anchor=tk.W)
-
-        thread_count_row = ttk.Frame(thread_frame)
-        thread_count_row.pack(fill=tk.X, pady=(4, 0))
-
-        ttk.Label(thread_count_row, text="并发线程数:").pack(side=tk.LEFT)
-        self.thread_var = tk.IntVar(value=self.config.get("max_threads", 3))
-        self.thread_spin = ttk.Spinbox(thread_count_row, from_=2, to=10,
-                                        textvariable=self.thread_var, width=5)
-        self.thread_spin.pack(side=tk.LEFT, padx=8)
-        self.thread_spin.config(state="normal" if self.mt_var.get() else "disabled")
-
         # --- Status / Log ---
         log_frame = ttk.LabelFrame(main_frame, text="状态日志", padding=8)
         log_frame.pack(fill=tk.BOTH, expand=True, pady=4)
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, width=70,
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=5, width=70,
                                                    state=tk.DISABLED, font=("Consolas", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
         # --- Buttons ---
         btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill=tk.X, pady=(8, 0))
+
+        start_api_btn = ttk.Button(btn_frame, text="启动 copilot-api 服务", command=self._on_start_copilot_api)
+        start_api_btn.pack(side=tk.LEFT, padx=4)
 
         cancel_btn = ttk.Button(btn_frame, text="取消", command=self._on_cancel)
         cancel_btn.pack(side=tk.RIGHT, padx=4)
@@ -298,7 +271,20 @@ class LLMConfigGUI:
         self.log_text.config(state=tk.DISABLED)
 
     def _on_mt_toggle(self):
-        self.thread_spin.config(state="normal" if self.mt_var.get() else "disabled")
+        pass  # No longer needed, multi-threading is always enabled
+
+    def _on_start_copilot_api(self):
+        """Open a new terminal window and run 'copilot-api start'."""
+        self._log("正在启动 copilot-api 服务 ...")
+        try:
+            subprocess.Popen(
+                'start cmd /k "copilot-api start"',
+                shell=True,
+            )
+            self._log("✓ 已在新窗口启动 copilot-api start")
+        except Exception as e:
+            self._log(f"✗ 启动失败: {e}")
+            messagebox.showerror("启动失败", f"无法启动 copilot-api: {e}")
 
     def _on_test_connection(self):
         url = self.url_var.get().strip()
@@ -353,21 +339,16 @@ class LLMConfigGUI:
 
     def _on_confirm(self):
         url = self.url_var.get().strip()
-        model = self.model_var.get().strip()
         if not url:
             messagebox.showwarning("提示", "请输入 API 地址")
-            return
-        if not model:
-            messagebox.showwarning("提示", "请选择或输入模型名称")
             return
 
         self.config = {
             "api_url": url,
             "api_key": self.key_var.get().strip(),
-            "model": model,
-            "models_list": list(self.model_combo['values']) if self.model_combo['values'] else [],
-            "enable_multithreading": self.mt_var.get(),
-            "max_threads": self.thread_var.get(),
+            "model": "gpt-4o",
+            "enable_multithreading": True,
+            "max_threads": 8,
         }
         save_config(self.config, self.workspace_dir)
         self.result = self.config

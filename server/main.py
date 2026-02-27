@@ -2752,11 +2752,11 @@ def handle_process_images_with_llm(args):
     config = load_llm_config(_workspace())
     api_url = config.get("api_url", "")
     api_key = config.get("api_key", "")
-    model = config.get("model", "")
-    enable_mt = config.get("enable_multithreading", False)
-    max_threads = config.get("max_threads", 3)
+    model = "gpt-4o"  # 锁定模型为 gpt-4o
+    enable_mt = True  # 默认启用多线程
+    max_threads = 8   # 默认8线程
 
-    if not api_url or not model:
+    if not api_url:
         return {"content": [{"type": "text", "text": (
             "未配置外部 LLM API。请先调用 configure_llm_api 打开配置窗口。"
         )}]}
