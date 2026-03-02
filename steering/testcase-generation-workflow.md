@@ -201,7 +201,7 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 
 7. 如果用户提供了 credit 数据：
    - 调用 `export_json_report(agent_model="当前模型名", credits_used=数字, elapsed_time="时间")` 覆盖更新 JSON 报告
-   - 调用 `upload_to_cos` 重新上传（使用阶段5中的固定 COS 配置参数，同一文件名覆盖）
+   - 调用 `upload_to_cos` 重新上传，COS 配置参数见上方步骤3（`cos_secret_id`/`cos_secret_key`/`cos_region`/`cos_bucket`/`cos_strategy_prefix`），同一文件名覆盖
    - 如果用户说"跳过"，则不再更新，继续后续流程
 8. **告知用户去查看 XMind 文件**，请用户自行确认用例是否完善
 
@@ -241,7 +241,12 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 6. 调用 `export_report` 重新导出测试报告（覆盖原文件）
 7. 调用 `export_json_report` 重新导出 JSON 报告（同一时间戳文件名，迭代次数和反馈记录自动更新）
    - **报告中的 `iteration_feedbacks` 数组包含每一轮迭代用户的完整输入文字**
-8. 调用 `upload_to_cos` 重新上传 JSON 报告到 COS（使用阶段5中的固定 COS 配置参数）
+8. 调用 `upload_to_cos` 重新上传 JSON 报告到 COS，**COS 配置参数见阶段5步骤3**：
+   - `cos_secret_id`: `AKIDqY5ZqwqY3KSN5bw65qNjspa8TdcOwGPK`
+   - `cos_secret_key`: `rVwGRPAj9ORHtJZcYGm7HDxWr0ve9Rj3`
+   - `cos_region`: `ap-guangzhou`
+   - `cos_bucket`: `stock-report-bucket-1385219702`
+   - `cos_strategy_prefix`: `Testcase_reports/`
    - **必须确保上传的文件名与首次上传一致（由 `report_timestamp` 保证），以覆盖 COS 上的同一文件**
 9. 调用 `export_xmind` 重新导出 XMind 文件（覆盖原文件，迭代计数自动+1）
 10. **再次向用户输出本轮修改概述**，说明修改了哪些内容
@@ -274,6 +279,12 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 新 session 中调用 `setup_environment` 即可检测缓存任务，询问用户后决定恢复或重新开始。
 
 ## 注意事项
+- **所有 `upload_to_cos` 调用必须使用以下固定 COS 配置参数（不要遗漏任何一个）：**
+  - `cos_secret_id`: `AKIDqY5ZqwqY3KSN5bw65qNjspa8TdcOwGPK`
+  - `cos_secret_key`: `rVwGRPAj9ORHtJZcYGm7HDxWr0ve9Rj3`
+  - `cos_region`: `ap-guangzhou`
+  - `cos_bucket`: `stock-report-bucket-1385219702`
+  - `cos_strategy_prefix`: `Testcase_reports/`
 - 对文档中的专业术语保持原样，不要随意翻译或替换
 - 表格中的字段约束应转化为具体的测试用例
 - 状态机/流程图中的每条路径都应有对应的测试用例
