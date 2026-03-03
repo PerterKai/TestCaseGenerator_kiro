@@ -130,9 +130,11 @@ keywords:
    - **始终优先使用 `append_module`**（单个模块对象，非数组），按模块名自动替换已有模块
    - `modules`（全量替换）仅在模块数量极少（≤3个）时使用，大量用例时禁止使用以避免参数截断
    - **参数截断 fallback**：如果 `append_module` 因数据量过大触发 "Missing parameter" 错误，改用 `file_path` 方式：
-     1. 用 `fsWrite` 将模块 JSON 写入 `.tmp/cache/pending_module.json`
-     2. 调用 `save_testcases(file_path=".tmp/cache/pending_module.json")`
-     3. 文件内容直接写模块对象：`{"name":"模块名","sub_modules":[...]}`
+     1. 用 `fsWrite` 写入 JSON 前部分（不超过50行）到 `.tmp/cache/pending_module.json`
+     2. 用 `fsAppend` 逐段追加剩余 JSON（每次不超过50行），直到完整写完
+     3. 调用 `save_testcases(file_path=".tmp/cache/pending_module.json")`
+     4. 文件内容直接写裸模块对象：`{"name":"模块名","sub_modules":[...]}`
+     - **注意：`fsWrite` 单次不能超过50行，大 JSON 必须用 `fsWrite` + `fsAppend` 分段写入**
 6. 重复直到所有模块处理完毕
 7. 调用 `get_testcases` 确认用例完整性
 
@@ -156,20 +158,20 @@ keywords:
 对生成的用例进行分维度自我审查，**固定3轮，每轮聚焦2个维度**，不允许跳过任何一轮。
 
 #### 第1轮：功能覆盖（覆盖完整性 + 图片覆盖）
-1. 调用 `get_testcases` 获取当前所有用例
-2. 检查：文档中每个功能点、接口、字段是否都有对应用例？流程图每条路径、状态图每个转换是否覆盖？
-3. 逐模块调用 `save_testcases(append_module=修改后的单个模块对象)` 保存
-4. 输出修改统计：修改了 X 个模块，新增/修改/删除了 X 个用例
+1. 调用 `get_module()` 获取模块列表概览，逐模块调用 `get_module(module_name=...)` 查看
+2. 检查：文档中每个功能点、接口、字段是否都有对应用例？流程图每条路径是否覆盖？
+3. 逐模块调用 `save_testcases(append_module=...)` 保存修改；重复/空模块用 `delete_module` 删除
+4. 输出修改统计
 
 #### 第2轮：反向场景（边界充分性 + 异常覆盖）
-1. 调用 `get_testcases` 获取当前所有用例
+1. 逐模块调用 `get_module(module_name=...)` 查看
 2. 检查：每个输入字段是否考虑了边界值？每个操作是否考虑了失败场景？
 3. 逐模块保存修改
 4. 输出修改统计
 
 #### 第3轮：质量打磨（步骤可执行性 + 预期结果明确性）
-1. 调用 `get_testcases` 获取当前所有用例
-2. 检查：步骤是否清晰可操作？预期结果是否具体可验证（不能用"操作失败"等模糊描述）？
+1. 逐模块调用 `get_module(module_name=...)` 查看
+2. 检查：步骤是否清晰可操作？预期结果是否具体可验证？
 3. 逐模块保存修改
 4. 输出修改统计
 
@@ -178,8 +180,13 @@ keywords:
 - 第3轮修改数 = 0 → 进入步骤 6
 
 #### Review 通用规则
+- **优先使用 `get_module(module_name=...)` 逐模块查看**，避免 `get_testcases` 全量加载占满上下文
 - 每轮使用 `append_module` 逐模块更新，不需要修改的模块无需重新提交
-- 如果 `append_module` 因数据量过大被截断，改用 `file_path` 方式（fsWrite 写文件 → save_testcases(file_path=...)）
+- **删除模块使用 `delete_module(module_names=[...])`**，无需全量替换
+- **大模块保存**：如果 `append_module` 因数据量过大被截断，改用 `file_path` 方式：
+  1. `fsWrite` 写前50行到 `.tmp/cache/pending_module.json`
+  2. `fsAppend` 逐段追加剩余内容（每次≤50行）
+  3. `save_testcases(file_path=".tmp/cache/pending_module.json")`
 - 在 Review 过程中，记录发现的需求疑问点和确认项
 
 ### 步骤 6: 首次导出 + 用例概述
@@ -281,4 +288,4 @@ keywords:
 - `append_module` 支持同名模块替换，不会产生重复
 - `save_testcases` 的 `append_module` 参数必须是单个模块对象（非数组），`modules` 参数必须是数组
 - **始终优先使用 `append_module` 逐模块保存**，`modules` 全量替换仅在模块极少（≤3个）时使用，大量用例时会因参数过大导致截断失败
-- **参数截断 fallback**：如果 `append_module` 触发 "Missing parameter" 错误，改用 `file_path`（fsWrite 写 JSON → save_testcases(file_path=...)）
+- **大模块 fallback**：如果 `append_module` 触发截断错误，改用 `file_path` 方式（`fsWrite` 写前50行 + `fsAppend` 逐段追加 → `save_testcases(file_path=...)`）。`fsWrite` 单次不能超过50行。

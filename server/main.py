@@ -1264,6 +1264,32 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
+        "name": "get_module",
+        "description": "Get a single module by name (returns full JSON), or list all module names with case counts if no name given. Use this instead of get_testcases when you only need to review or modify one module, to reduce context usage.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "module_name": {"type": "string", "description": "Module name to retrieve. If omitted, returns a lightweight list of all module names with case counts."}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "delete_module",
+        "description": "Delete one or more modules by name. Use this to remove duplicate, empty, or unwanted modules without needing to resubmit all modules via full replacement.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "module_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of module names to delete"
+                }
+            },
+            "required": ["module_names"]
+        }
+    },
+    {
         "name": "export_xmind",
         "description": "Export test cases to XMind format. File named as 需求名_testCase.xmind by default.",
         "inputSchema": {
@@ -1736,10 +1762,10 @@ def handle_get_workflow_state(args):
     elif (img_completed or total_imgs == 0) and not has_testcases:
         lines.append("▶ 继续操作: 调用 get_doc_summary 获取文档结构，然后按模块生成测试用例")
     elif has_testcases and export_status != "completed":
-        lines.append("▶ 继续操作: 调用 get_testcases 查看已有用例，可继续生成或调用 review_module_structure 审查模块结构，最后调用 export_xmind 和 export_report 导出")
+        lines.append("▶ 继续操作: 调用 get_module() 查看已有用例，可继续生成或调用 review_module_structure 审查模块结构，最后按顺序调用 export_report → export_json_report → upload_to_cos → export_xmind 导出")
     elif export_status == "completed":
         lines.append("▶ 已导出 XMind 和测试报告。可以继续修改用例并重新导出，或确认用例完善后结束流程。")
-        lines.append("  - 如需修改用例: 调用 get_testcases 查看当前用例，修改后调用 save_testcases(append_module=...) 保存，再按顺序调用 export_report → export_json_report → upload_to_cos → export_xmind 重新导出")
+        lines.append("  - 如需修改用例: 调用 get_module() 查看模块列表，get_module(module_name=...) 查看具体模块，修改后调用 save_testcases(append_module=...) 保存，再按顺序调用 export_report → export_json_report → upload_to_cos → export_xmind 重新导出")
         lines.append("  - 如需重新生成: 调用 clear_cache 清除缓存后重新开始")
     elif parse_status == "completed":
         lines.append("▶ 继续操作: 调用 configure_llm_api + process_images_with_llm 开始处理图片")
@@ -2049,6 +2075,81 @@ def handle_get_testcases(args):
     }
 
 
+def handle_get_module(args):
+    """Get a single module by name, or list all module names if no name given."""
+    if not testcase_store["modules"]:
+        _restore_store_from_cache()
+
+    module_name = args.get("module_name", "").strip()
+
+    if not module_name:
+        # Return module name list with case counts (lightweight overview)
+        summary = []
+        for m in testcase_store["modules"]:
+            case_count = sum(len(s.get("test_cases", [])) for s in m.get("sub_modules", []))
+            sub_count = len(m.get("sub_modules", []))
+            summary.append({"name": m["name"], "sub_module_count": sub_count, "case_count": case_count})
+        return {
+            "content": [{"type": "text", "text": json.dumps(summary, ensure_ascii=False, indent=2)}],
+            "module_count": len(summary),
+        }
+
+    # Find module by name (fuzzy: strip + case-insensitive)
+    target_key = module_name.strip().lower()
+    for m in testcase_store["modules"]:
+        if m.get("name", "").strip().lower() == target_key:
+            case_count = sum(len(s.get("test_cases", [])) for s in m.get("sub_modules", []))
+            return {
+                "content": [{"type": "text", "text": json.dumps(m, ensure_ascii=False, indent=2)}],
+                "module_name": m["name"],
+                "sub_module_count": len(m.get("sub_modules", [])),
+                "case_count": case_count,
+            }
+
+    # Not found
+    available = [m["name"] for m in testcase_store["modules"]]
+    return {"content": [{"type": "text", "text": (
+        f"模块 '{module_name}' 未找到。\n当前模块列表: {', '.join(available)}"
+    )}]}
+
+
+def handle_delete_module(args):
+    """Delete one or more modules by name."""
+    if not testcase_store["modules"]:
+        _restore_store_from_cache()
+
+    module_names = args.get("module_names", [])
+    if isinstance(module_names, str):
+        module_names = [module_names]
+    if not module_names:
+        return {"content": [{"type": "text", "text": "错误: 必须提供 module_names 参数（模块名称列表）"}]}
+
+    target_keys = {n.strip().lower() for n in module_names}
+    before_count = len(testcase_store["modules"])
+    removed = []
+    kept = []
+    for m in testcase_store["modules"]:
+        if m.get("name", "").strip().lower() in target_keys:
+            removed.append(m["name"])
+        else:
+            kept.append(m)
+
+    if not removed:
+        available = [m["name"] for m in testcase_store["modules"]]
+        return {"content": [{"type": "text", "text": (
+            f"未找到要删除的模块: {', '.join(module_names)}\n当前模块列表: {', '.join(available)}"
+        )}]}
+
+    testcase_store["modules"] = kept
+    _sync_store_to_cache()
+
+    total = sum(len(s.get("test_cases", [])) for m in kept for s in m.get("sub_modules", []))
+    return {"content": [{"type": "text", "text": (
+        f"✓ 已删除 {len(removed)} 个模块: {', '.join(removed)}\n"
+        f"当前剩余 {len(kept)} 个模块, {total} 个用例"
+    )}]}
+
+
 def _get_requirement_name():
     """Extract requirement name from parsed documents for file naming."""
     md_files = testcase_store.get("md_files", [])
@@ -2193,7 +2294,10 @@ def handle_review_module_structure(args):
     if not issues and not suggestions:
         lines.append("\n✅ 模块结构合理，未发现明显问题。")
 
-    lines.append("\n如需调整模块结构，请对需要修改的模块逐个调用 save_testcases(append_module=调整后的单个模块对象) 保存。")
+    lines.append("\n如需调整模块结构：")
+    lines.append("  - 修改模块: 调用 save_testcases(append_module=调整后的单个模块对象) 保存")
+    lines.append("  - 删除模块: 调用 delete_module(module_names=[\"模块名\"]) 删除")
+    lines.append("  - 查看单个模块: 调用 get_module(module_name=\"模块名\") 获取完整内容")
 
     return {
         "content": [{"type": "text", "text": "\n".join(lines)}],
@@ -2939,6 +3043,8 @@ HANDLERS = {
     "get_parsed_markdown": handle_get_parsed_markdown,
     "save_testcases": handle_save_testcases,
     "get_testcases": handle_get_testcases,
+    "get_module": handle_get_module,
+    "delete_module": handle_delete_module,
     "export_xmind": handle_export_xmind,
     "review_module_structure": handle_review_module_structure,
     "export_report": handle_export_report,
