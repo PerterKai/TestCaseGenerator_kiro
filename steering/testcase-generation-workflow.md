@@ -4,6 +4,24 @@ inclusion: manual
 
 # 测试用例生成工作流
 
+## ⚠️ 关键规则（必须严格遵守）
+
+### 导出顺序（阶段5和每次迭代都适用）
+**export_report → export_json_report → upload_to_cos → export_xmind**
+绝对不能先导出 xmind 再生成 json 报告。json 报告和 COS 上传必须在 xmind 之前完成。
+
+### COS 固定配置（所有 upload_to_cos 调用必须使用）
+```
+cos_secret_id:       AKIDqY5ZqwqY3KSN5bw65qNjspa8TdcOwGPK
+cos_secret_key:      rVwGRPAj9ORHtJZcYGm7HDxWr0ve9Rj3
+cos_region:          ap-guangzhou
+cos_bucket:          stock-report-bucket-1385219702
+cos_strategy_prefix: Testcase_reports/
+```
+每次调用 `upload_to_cos` 时必须传入以上全部5个参数，不可省略。
+
+---
+
 ## 完整工作流程（分阶段，支持跨 session 恢复）
 
 ### 阶段0: 环境检查与任务决策（每次启动必做）
@@ -180,12 +198,7 @@ XMind 导出层级（链式嵌套，每层单子节点）：
    - 此时不含 credit 信息，后续用户提供后覆盖更新
    - **记住此次生成的 `report_filename`（如 `需求名_report_20260227_143052.json`），后续所有迭代必须使用同一文件名上传 COS 以实现覆盖**
 3. 调用 `upload_to_cos` 将 JSON 报告上传到腾讯云 COS
-   - 使用以下固定配置参数：
-     - `cos_secret_id`: `AKIDqY5ZqwqY3KSN5bw65qNjspa8TdcOwGPK`
-     - `cos_secret_key`: `rVwGRPAj9ORHtJZcYGm7HDxWr0ve9Rj3`
-     - `cos_region`: `ap-guangzhou`
-     - `cos_bucket`: `stock-report-bucket-1385219702`
-     - `cos_strategy_prefix`: `Testcase_reports/`
+   - **使用文件顶部「COS 固定配置」中的全部5个参数**
    - 上传成功后向用户展示 COS URL
    - 上传失败时提示错误信息，不阻塞后续流程
 4. 调用 `export_xmind` 导出 XMind 文件（自动命名为 `需求名_testCase.xmind`）
@@ -201,7 +214,7 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 
 7. 如果用户提供了 credit 数据：
    - 调用 `export_json_report(agent_model="当前模型名", credits_used=数字, elapsed_time="时间")` 覆盖更新 JSON 报告
-   - 调用 `upload_to_cos` 重新上传，COS 配置参数见上方步骤3（`cos_secret_id`/`cos_secret_key`/`cos_region`/`cos_bucket`/`cos_strategy_prefix`），同一文件名覆盖
+   - 调用 `upload_to_cos` 重新上传（**使用文件顶部「COS 固定配置」**，同一文件名覆盖）
    - 如果用户说"跳过"，则不再更新，继续后续流程
 8. **告知用户去查看 XMind 文件**，请用户自行确认用例是否完善
 
@@ -241,12 +254,7 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 6. 调用 `export_report` 重新导出测试报告（覆盖原文件）
 7. 调用 `export_json_report` 重新导出 JSON 报告（同一时间戳文件名，迭代次数和反馈记录自动更新）
    - **报告中的 `iteration_feedbacks` 数组包含每一轮迭代用户的完整输入文字**
-8. 调用 `upload_to_cos` 重新上传 JSON 报告到 COS，**COS 配置参数见阶段5步骤3**：
-   - `cos_secret_id`: `AKIDqY5ZqwqY3KSN5bw65qNjspa8TdcOwGPK`
-   - `cos_secret_key`: `rVwGRPAj9ORHtJZcYGm7HDxWr0ve9Rj3`
-   - `cos_region`: `ap-guangzhou`
-   - `cos_bucket`: `stock-report-bucket-1385219702`
-   - `cos_strategy_prefix`: `Testcase_reports/`
+8. 调用 `upload_to_cos` 重新上传 JSON 报告到 COS（**使用文件顶部「COS 固定配置」**）
    - **必须确保上传的文件名与首次上传一致（由 `report_timestamp` 保证），以覆盖 COS 上的同一文件**
 9. 调用 `export_xmind` 重新导出 XMind 文件（覆盖原文件，迭代计数自动+1）
 10. **再次向用户输出本轮修改概述**，说明修改了哪些内容
