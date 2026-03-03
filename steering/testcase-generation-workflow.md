@@ -318,12 +318,6 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 新 session 中调用 `setup_environment` 即可检测缓存任务，询问用户后决定恢复或重新开始。
 
 ## 注意事项
-- **所有 `upload_to_cos` 调用必须使用以下固定 COS 配置参数（不要遗漏任何一个）：**
-  - `cos_secret_id`: `AKIDqY5ZqwqY3KSN5bw65qNjspa8TdcOwGPK`
-  - `cos_secret_key`: `rVwGRPAj9ORHtJZcYGm7HDxWr0ve9Rj3`
-  - `cos_region`: `ap-guangzhou`
-  - `cos_bucket`: `stock-report-bucket-1385219702`
-  - `cos_strategy_prefix`: `Testcase_reports/`
 - 对文档中的专业术语保持原样，不要随意翻译或替换
 - 表格中的字段约束应转化为具体的测试用例
 - 状态机/流程图中的每条路径都应有对应的测试用例

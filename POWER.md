@@ -149,42 +149,70 @@ keywords:
 根据审查结果调整模块结构，对需要调整的模块逐个调用 `save_testcases(append_module=调整后的单个模块对象)` 保存。
 
 ### 步骤 5: 自动 Review 与迭代
+对生成的用例进行分维度自我审查，**固定3轮，每轮聚焦2个维度**，不允许跳过任何一轮。
+
+#### 第1轮：功能覆盖（覆盖完整性 + 图片覆盖）
 1. 调用 `get_testcases` 获取当前所有用例
-2. 审查功能覆盖、边界条件、异常场景、步骤可执行性
-3. 对需要修改的模块，逐个调用 `save_testcases(append_module=修改后的单个模块对象)` 保存
-   - **Review 阶段也使用 `append_module` 逐模块更新**，按模块名自动替换，避免全量提交导致参数截断
-   - 不需要修改的模块无需重新提交
-4. 重复 1-3，迭代 2-3 轮
-5. 在 Review 过程中，记录发现的需求疑问点和确认项
+2. 检查：文档中每个功能点、接口、字段是否都有对应用例？流程图每条路径、状态图每个转换是否覆盖？
+3. 逐模块调用 `save_testcases(append_module=修改后的单个模块对象)` 保存
+4. 输出修改统计：修改了 X 个模块，新增/修改/删除了 X 个用例
+
+#### 第2轮：反向场景（边界充分性 + 异常覆盖）
+1. 调用 `get_testcases` 获取当前所有用例
+2. 检查：每个输入字段是否考虑了边界值？每个操作是否考虑了失败场景？
+3. 逐模块保存修改
+4. 输出修改统计
+
+#### 第3轮：质量打磨（步骤可执行性 + 预期结果明确性）
+1. 调用 `get_testcases` 获取当前所有用例
+2. 检查：步骤是否清晰可操作？预期结果是否具体可验证（不能用"操作失败"等模糊描述）？
+3. 逐模块保存修改
+4. 输出修改统计
+
+#### 量化退出
+- 第3轮修改数 > 0 → 追加第4轮全维度复查（仅针对修改过的模块），最多4轮
+- 第3轮修改数 = 0 → 进入步骤 6
+
+#### Review 通用规则
+- 每轮使用 `append_module` 逐模块更新，不需要修改的模块无需重新提交
+- 在 Review 过程中，记录发现的需求疑问点和确认项
 
 ### 步骤 6: 首次导出 + 用例概述
-自动 Review 完成后：
-1. 调用 `export_xmind` 导出 `.xmind` 文件（自动命名为 `需求名_testCase.xmind`）
-2. 调用 `export_report(questions=[...])` 导出测试报告（自动命名为 `需求名_testCaseReport.md`）
-   - 传入 `questions` 参数，包含 Review 过程中发现的需求疑问点
-   - 报告包含：模块概览、覆盖维度统计、需求疑问点
-3. **向用户输出用例生成概述**，内容包括：
-   - 用例生成情况总结：共生成 X 个模块、X 个子模块、X 个用例
-   - 各模块用例分布概览
-   - 覆盖维度统计（正向/边界/异常/安全/性能）
-   - 可能需要产品澄清或测试确认的疑问点列表
-4. **询问用户提供 Kiro credit 消耗数据**：
+自动 Review 完成后，按以下固定顺序导出（**report.json 和 COS 上传在 XMind 之前**）：
 
-> 请查看聊天窗口底部的 "Credits used" 和 "Elapsed time" 数值，告诉我具体数字，我会写入 JSON 报告。
+1. 调用 `export_report(questions=[...])` 导出测试报告（`需求名_testCaseReport.md`）
+   - 传入 `questions` 参数，包含 Review 过程中发现的需求疑问点
+2. 调用 `export_json_report(agent_model="当前模型名")` 导出 JSON 报告
+   - 文件名自动带时间戳：`需求名_report_20260227_143052.json`
+   - 同一任务多次导出复用同一时间戳，确保 COS 上覆盖同一文件
+   - `agent_model` 从 system prompt 的 model_information 获取
+3. 调用 `upload_to_cos` 上传 JSON 报告到腾讯云 COS
+   - COS 配置参数（每次调用必须全部传入）：
+     - `cos_secret_id`: `AKIDqY5ZqwqY3KSN5bw65qNjspa8TdcOwGPK`
+     - `cos_secret_key`: `rVwGRPAj9ORHtJZcYGm7HDxWr0ve9Rj3`
+     - `cos_region`: `ap-guangzhou`
+     - `cos_bucket`: `stock-report-bucket-1385219702`
+     - `cos_strategy_prefix`: `Testcase_reports/`
+   - 上传失败不阻塞后续流程
+4. 调用 `export_xmind` 导出 XMind 文件（`需求名_testCase.xmind`）
+5. **向用户输出用例生成概述**：模块数、用例数、覆盖维度、疑问点
+6. **询问用户提供 Kiro credit 消耗数据**：
+
+> 请查看聊天窗口底部的 "Credits used" 和 "Elapsed time" 数值，告诉我具体数字，我会写入 JSON 报告并重新上传。
 > 如果不需要记录，直接说"跳过"即可。
 
-5. 根据用户回复调用 `export_json_report` 导出 JSON 报告（自动命名为 `需求名_report.json`）：
-   - 用户提供了数字 → `export_json_report(agent_model="当前模型名", credits_used=数字, elapsed_time="时间")`
-   - 用户说"跳过" → `export_json_report(agent_model="当前模型名")`
-   - `agent_model` 参数传入当前 agent 使用的模型名称（从 system prompt 中的 model_information 获取）
-6. **告知用户去查看 XMind 文件**，请用户自行确认用例是否完善
+7. 如果用户提供了 credit 数据：
+   - 调用 `export_json_report(agent_model="当前模型名", credits_used=数字, elapsed_time="时间")` 覆盖更新
+   - 调用 `upload_to_cos` 重新上传（同一 COS 配置，同一文件名覆盖）
+   - 用户说"跳过"则不更新
+8. **告知用户查看 XMind 文件**，请用户确认用例是否完善
 
 向用户发送的消息模板：
 
 > 用例已生成并导出，请查看：
 > - XMind 文件：`需求名_testCase.xmind`
 > - 测试报告：`需求名_testCaseReport.md`
-> - JSON 报告：`需求名_report.json`
+> - JSON 报告：`需求名_report_时间戳.json`（已上传 COS）
 >
 > **生成概述：** 共 X 个模块、X 个用例，覆盖正向功能/边界条件/异常处理/安全性等维度。
 >
@@ -206,15 +234,17 @@ keywords:
 
 #### 7.2 用户反馈需要补充/修改 → 迭代更新
 如果用户提出修改意见（如遗漏场景、用例不准确、需要补充等）：
-1. 根据用户反馈，定位需要修改的模块
-2. 如需回顾文档内容，调用 `get_doc_section` 重新读取相关章节
-3. 修改或补充对应模块的用例
-4. 调用 `save_testcases(append_module=修改后的单个模块对象)` 保存更新
-5. 调用 `export_xmind` 重新导出 XMind 文件（覆盖原文件）
+1. 调用 `record_iteration_feedback(user_message="用户原话")` 记录本轮用户反馈
+2. 根据用户反馈，定位需要修改的模块
+3. 如需回顾文档内容，调用 `get_doc_section` 重新读取相关章节
+4. 修改或补充对应模块的用例
+5. 调用 `save_testcases(append_module=修改后的单个模块对象)` 保存更新
 6. 调用 `export_report` 重新导出测试报告（覆盖原文件）
-7. 调用 `export_json_report` 重新导出 JSON 报告（覆盖原文件）
-8. **再次向用户输出本轮修改概述**，说明修改了哪些内容
-9. **再次请用户确认**用例是否完善
+7. 调用 `export_json_report` 重新导出 JSON 报告（同一时间戳文件名覆盖）
+8. 调用 `upload_to_cos` 重新上传 JSON 报告到 COS（同一 COS 配置，同一文件名覆盖）
+9. 调用 `export_xmind` 重新导出 XMind 文件（覆盖原文件）
+10. **再次向用户输出本轮修改概述**，说明修改了哪些内容
+11. **再次请用户确认**用例是否完善
 
 **重复步骤 7，直到用户确认用例完善为止。**
 
@@ -234,9 +264,9 @@ keywords:
 - 新任务开始前，必须确认文档已就位
 - 新任务开始前，必须让用户选择处理模式（文档+图片 / 纯文档）
 - 对文档内容有疑问时，主动向用户确认，不要自行猜测
-- **自动 Review 完成后，必须先导出 XMind 和报告，然后向用户输出用例概述和疑问点，请用户查看 XMind 确认**
+- **自动 Review 完成后，必须按顺序：export_report → export_json_report → upload_to_cos → export_xmind，然后向用户输出概述和疑问点**
 - **必须等待用户明确确认"用例完善"后才能结束流程，不能自行判断结束**
-- **用户反馈需要修改时，修改用例后必须重新导出 XMind 和报告，再次请用户确认**
+- **用户反馈需要修改时，修改后必须重新导出 report.json + 上传 COS + 导出 XMind，再次请用户确认**
 
 ## 注意事项
 
