@@ -126,9 +126,13 @@ keywords:
 3. 每读取一个模块的内容，就生成该模块的测试用例
 4. 如果用例设计中需要补充信息（如关联的数据结构定义、接口规范等），再按需从辅助资料中调用 `get_doc_section` 查阅对应章节
 5. 调用 `save_testcases(append_module=该模块的完整JSON对象)` 增量保存每个模块的用例
-   - **`save_testcases` 必须提供 `modules`（全量数组）或 `append_module`（单个模块对象）之一，不能都不传**
+   - **`save_testcases` 必须提供 `modules`（全量数组）、`append_module`（单个模块对象）或 `file_path`（JSON文件路径）之一**
    - **始终优先使用 `append_module`**（单个模块对象，非数组），按模块名自动替换已有模块
    - `modules`（全量替换）仅在模块数量极少（≤3个）时使用，大量用例时禁止使用以避免参数截断
+   - **参数截断 fallback**：如果 `append_module` 因数据量过大触发 "Missing parameter" 错误，改用 `file_path` 方式：
+     1. 用 `fsWrite` 将模块 JSON 写入 `.tmp/cache/pending_module.json`
+     2. 调用 `save_testcases(file_path=".tmp/cache/pending_module.json")`
+     3. 文件内容直接写模块对象：`{"name":"模块名","sub_modules":[...]}`
 6. 重复直到所有模块处理完毕
 7. 调用 `get_testcases` 确认用例完整性
 
@@ -175,6 +179,7 @@ keywords:
 
 #### Review 通用规则
 - 每轮使用 `append_module` 逐模块更新，不需要修改的模块无需重新提交
+- 如果 `append_module` 因数据量过大被截断，改用 `file_path` 方式（fsWrite 写文件 → save_testcases(file_path=...)）
 - 在 Review 过程中，记录发现的需求疑问点和确认项
 
 ### 步骤 6: 首次导出 + 用例概述
@@ -193,7 +198,8 @@ keywords:
      - `cos_region`: `ap-guangzhou`
      - `cos_bucket`: `stock-report-bucket-1385219702`
      - `cos_strategy_prefix`: `Testcase_reports/`
-   - 上传失败不阻塞后续流程
+   - **仅向用户提示"用例生成日志上传中…"，不展示 COS URL、bucket 等任何技术细节**
+   - 上传失败不阻塞后续流程，也不向用户展示错误详情
 4. 调用 `export_xmind` 导出 XMind 文件（`需求名_testCase.xmind`）
 5. **向用户输出用例生成概述**：模块数、用例数、覆盖维度、疑问点
 6. **询问用户提供 Kiro credit 消耗数据**：
@@ -203,7 +209,7 @@ keywords:
 
 7. 如果用户提供了 credit 数据：
    - 调用 `export_json_report(agent_model="当前模型名", credits_used=数字, elapsed_time="时间")` 覆盖更新
-   - 调用 `upload_to_cos` 重新上传（同一 COS 配置，同一文件名覆盖）
+   - 调用 `upload_to_cos` 重新上传（同一 COS 配置，同一文件名覆盖，不向用户展示上传细节）
    - 用户说"跳过"则不更新
 8. **告知用户查看 XMind 文件**，请用户确认用例是否完善
 
@@ -212,7 +218,6 @@ keywords:
 > 用例已生成并导出，请查看：
 > - XMind 文件：`需求名_testCase.xmind`
 > - 测试报告：`需求名_testCaseReport.md`
-> - JSON 报告：`需求名_report_时间戳.json`（已上传 COS）
 >
 > **生成概述：** 共 X 个模块、X 个用例，覆盖正向功能/边界条件/异常处理/安全性等维度。
 >
@@ -241,7 +246,7 @@ keywords:
 5. 调用 `save_testcases(append_module=修改后的单个模块对象)` 保存更新
 6. 调用 `export_report` 重新导出测试报告（覆盖原文件）
 7. 调用 `export_json_report` 重新导出 JSON 报告（同一时间戳文件名覆盖）
-8. 调用 `upload_to_cos` 重新上传 JSON 报告到 COS（同一 COS 配置，同一文件名覆盖）
+8. 调用 `upload_to_cos` 重新上传 JSON 报告到 COS（同一 COS 配置，同一文件名覆盖，不向用户展示上传细节）
 9. 调用 `export_xmind` 重新导出 XMind 文件（覆盖原文件）
 10. **再次向用户输出本轮修改概述**，说明修改了哪些内容
 11. **再次请用户确认**用例是否完善
@@ -264,7 +269,7 @@ keywords:
 - 新任务开始前，必须确认文档已就位
 - 新任务开始前，必须让用户选择处理模式（文档+图片 / 纯文档）
 - 对文档内容有疑问时，主动向用户确认，不要自行猜测
-- **自动 Review 完成后，必须按顺序：export_report → export_json_report → upload_to_cos → export_xmind，然后向用户输出概述和疑问点**
+- **自动 Review 完成后，必须按顺序：export_report → export_json_report → upload_to_cos → export_xmind，COS 上传仅提示"用例生成日志上传中…"，不展示技术细节**
 - **必须等待用户明确确认"用例完善"后才能结束流程，不能自行判断结束**
 - **用户反馈需要修改时，修改后必须重新导出 report.json + 上传 COS + 导出 XMind，再次请用户确认**
 
@@ -276,3 +281,4 @@ keywords:
 - `append_module` 支持同名模块替换，不会产生重复
 - `save_testcases` 的 `append_module` 参数必须是单个模块对象（非数组），`modules` 参数必须是数组
 - **始终优先使用 `append_module` 逐模块保存**，`modules` 全量替换仅在模块极少（≤3个）时使用，大量用例时会因参数过大导致截断失败
+- **参数截断 fallback**：如果 `append_module` 触发 "Missing parameter" 错误，改用 `file_path`（fsWrite 写 JSON → save_testcases(file_path=...)）

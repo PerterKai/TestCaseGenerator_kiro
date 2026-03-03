@@ -1247,12 +1247,13 @@ TOOLS = [
     },
     {
         "name": "save_testcases",
-        "description": "Save test cases. Also persists to .tmp/cache/testcases.json for cross-session access. Supports incremental save via append_module parameter.",
+        "description": "Save test cases. Also persists to .tmp/cache/testcases.json for cross-session access. Supports incremental save via append_module parameter. For large modules that exceed parameter size limits, use file_path to pass data via a JSON file instead.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "modules": {"type": "array", "description": "Test case module list", "items": {"type": "object"}},
-                "append_module": {"type": "object", "description": "Single module to append to existing cases (for incremental generation)"}
+                "append_module": {"type": "object", "description": "Single module to append to existing cases (for incremental generation)"},
+                "file_path": {"type": "string", "description": "Path to a JSON file containing the module data. The file should have either {\"modules\": [...]} or {\"append_module\": {...}}. Use this when module data is too large for direct parameter passing."}
             },
             "required": []
         }
@@ -1738,7 +1739,7 @@ def handle_get_workflow_state(args):
         lines.append("▶ 继续操作: 调用 get_testcases 查看已有用例，可继续生成或调用 review_module_structure 审查模块结构，最后调用 export_xmind 和 export_report 导出")
     elif export_status == "completed":
         lines.append("▶ 已导出 XMind 和测试报告。可以继续修改用例并重新导出，或确认用例完善后结束流程。")
-        lines.append("  - 如需修改用例: 调用 get_testcases 查看当前用例，修改后调用 save_testcases(append_module=...) 保存，再调用 export_xmind + export_report 重新导出")
+        lines.append("  - 如需修改用例: 调用 get_testcases 查看当前用例，修改后调用 save_testcases(append_module=...) 保存，再按顺序调用 export_report → export_json_report → upload_to_cos → export_xmind 重新导出")
         lines.append("  - 如需重新生成: 调用 clear_cache 清除缓存后重新开始")
     elif parse_status == "completed":
         lines.append("▶ 继续操作: 调用 configure_llm_api + process_images_with_llm 开始处理图片")
@@ -1933,6 +1934,42 @@ def handle_get_parsed_markdown(args):
 def handle_save_testcases(args):
     modules = args.get("modules", None)
     append_module = args.get("append_module", None)
+    file_path = args.get("file_path", None)
+
+    # --- file_path: load data from JSON file ---
+    if file_path:
+        if not os.path.isabs(file_path):
+            file_path = os.path.join(_workspace(), file_path)
+        if not os.path.exists(file_path):
+            return {"content": [{"type": "text", "text": f"Error: file not found: {file_path}"}]}
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                file_data = json.load(f)
+        except json.JSONDecodeError as e:
+            return {"content": [{"type": "text", "text": f"Error: invalid JSON in {file_path}: {e}"}]}
+        except Exception as e:
+            return {"content": [{"type": "text", "text": f"Error: failed to read {file_path}: {e}"}]}
+
+        # Extract modules or append_module from file data
+        if "append_module" in file_data:
+            append_module = file_data["append_module"]
+        elif "modules" in file_data:
+            modules = file_data["modules"]
+        elif "name" in file_data and "sub_modules" in file_data:
+            # File contains a bare module object (no wrapper key)
+            append_module = file_data
+        else:
+            return {"content": [{"type": "text", "text": (
+                "Error: JSON file must contain either {\"append_module\": {...}} or {\"modules\": [...]} "
+                "or be a bare module object with 'name' and 'sub_modules' fields."
+            )}]}
+
+        # Clean up temp file after successful read
+        try:
+            if '.tmp' in file_path:
+                os.remove(file_path)
+        except Exception:
+            pass
 
     if append_module:
         # Validate structure
@@ -1969,13 +2006,15 @@ def handle_save_testcases(args):
 
     if modules is None:
         return {"content": [{"type": "text", "text": (
-            "Missing parameter: modules or append_module.\n"
-            "必须提供 modules（全量数组）或 append_module（单个模块对象）之一。\n\n"
-            "⚠️ 如果你正在尝试全量替换但数据量太大导致参数丢失，请改用 append_module 逐个模块更新：\n"
-            "  1. 调用 get_testcases 获取当前用例\n"
-            "  2. 对需要修改的模块，逐个调用 save_testcases(append_module={修改后的单个模块对象})\n"
-            "  3. append_module 会自动按模块名替换已有模块\n"
-            "  4. 不需要修改的模块无需重新提交"
+            "Missing parameter: modules, append_module, or file_path.\n"
+            "必须提供以下之一：\n"
+            "  - append_module: 单个模块对象（推荐）\n"
+            "  - modules: 全量模块数组\n"
+            "  - file_path: 包含模块数据的 JSON 文件路径\n\n"
+            "⚠️ 如果数据量太大导致参数被截断，请使用 file_path 方式：\n"
+            "  1. 用 fsWrite 将模块 JSON 写入临时文件（如 .tmp/cache/pending_module.json）\n"
+            "  2. 调用 save_testcases(file_path=\".tmp/cache/pending_module.json\")\n"
+            "  3. 文件内容可以是 {\"append_module\": {...}} 或直接是模块对象 {\"name\":\"...\",\"sub_modules\":[...]}"
         )}]}
 
     if not isinstance(modules, list):
