@@ -11,12 +11,68 @@ import os
 import sys
 import subprocess
 import threading
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+import platform
 import urllib.request
 import urllib.error
 import ssl
 import base64
+
+# Lazy-import tkinter — may not be available on all platforms
+_tk = None
+_ttk = None
+_messagebox = None
+_scrolledtext = None
+
+
+def _ensure_tk():
+    """Try to import tkinter. Returns True if available."""
+    global _tk, _ttk, _messagebox, _scrolledtext
+    if _tk is not None:
+        return True
+    try:
+        import tkinter as tk
+        from tkinter import ttk, messagebox, scrolledtext
+        _tk = tk
+        _ttk = ttk
+        _messagebox = messagebox
+        _scrolledtext = scrolledtext
+        return True
+    except ImportError:
+        return False
+
+
+def check_gui_available():
+    """Check if GUI (tkinter + display) is available on this system.
+    Returns (available: bool, reason: str).
+    """
+    # 1. Check tkinter importable
+    if not _ensure_tk():
+        hint = ""
+        if platform.system() == "Darwin":
+            hint = "  修复方法: brew install python-tk@3.x (x 为你的 Python 次版本号)"
+        elif platform.system() == "Linux":
+            hint = "  修复方法: sudo apt install python3-tk  或  sudo yum install python3-tkinter"
+        return False, f"tkinter 未安装，无法打开 GUI 配置窗口。{hint}"
+
+    # 2. Check display environment (Linux/macOS headless detection)
+    if platform.system() != "Windows":
+        # macOS doesn't need DISPLAY if running natively, but as a subprocess
+        # of a headless process (like MCP server), it may still fail.
+        # Try a quick Tk() instantiation to be sure.
+        try:
+            root = _tk.Tk()
+            root.withdraw()
+            root.destroy()
+        except Exception as e:
+            err_str = str(e)
+            if "no display" in err_str.lower() or "cannot open display" in err_str.lower():
+                return False, "无显示环境（headless），无法打开 GUI 窗口。将使用参数配置模式。"
+            elif "application" in err_str.lower() and "nsapplication" in err_str.lower():
+                return False, "macOS 子进程无法访问窗口服务器，无法打开 GUI 窗口。将使用参数配置模式。"
+            else:
+                return False, f"GUI 初始化失败: {err_str}。将使用参数配置模式。"
+
+    return True, "GUI 可用"
 
 CONFIG_FILENAME = "llm_api_config.json"
 
@@ -187,13 +243,15 @@ class LLMConfigGUI:
     """Tkinter GUI for configuring external multimodal LLM API."""
 
     def __init__(self, workspace_dir=None):
+        if not _ensure_tk():
+            raise RuntimeError("tkinter is not available")
         self.workspace_dir = workspace_dir
         self.config = load_config(workspace_dir)
         self.result = None  # Will be set to config dict if user confirms
         self._build_ui()
 
     def _build_ui(self):
-        self.root = tk.Tk()
+        self.root = _tk.Tk()
         self.root.title("外部多模态 LLM API 配置")
         self.root.geometry("620x420")
         self.root.resizable(False, False)
@@ -206,91 +264,112 @@ class LLMConfigGUI:
         y = (self.root.winfo_screenheight() // 2) - (h // 2)
         self.root.geometry(f"+{x}+{y}")
 
-        main_frame = ttk.Frame(self.root, padding=15)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        main_frame = _ttk.Frame(self.root, padding=15)
+        main_frame.pack(fill=_tk.BOTH, expand=True)
 
         # Title
-        title_label = ttk.Label(main_frame, text="配置外部多模态 LLM API 进行图片解析",
+        title_label = _ttk.Label(main_frame, text="配置外部多模态 LLM API 进行图片解析",
                                 font=("", 12, "bold"))
-        title_label.pack(anchor=tk.W, pady=(0, 5))
+        title_label.pack(anchor=_tk.W, pady=(0, 5))
 
         # Info label
-        info_label = ttk.Label(main_frame, text="模型: gpt-4o（固定）  |  并发线程: 8",
+        info_label = _ttk.Label(main_frame, text="模型: gpt-4o（固定）  |  并发线程: 8",
                                font=("", 9))
-        info_label.pack(anchor=tk.W, pady=(0, 10))
+        info_label.pack(anchor=_tk.W, pady=(0, 10))
 
         # --- API URL ---
-        url_frame = ttk.LabelFrame(main_frame, text="API 地址", padding=8)
-        url_frame.pack(fill=tk.X, pady=4)
+        url_frame = _ttk.LabelFrame(main_frame, text="API 地址", padding=8)
+        url_frame.pack(fill=_tk.X, pady=4)
 
-        self.url_var = tk.StringVar(value=self.config.get("api_url", "http://localhost:4141/"))
-        url_entry = ttk.Entry(url_frame, textvariable=self.url_var, width=60)
-        url_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.url_var = _tk.StringVar(value=self.config.get("api_url", "http://localhost:4141/"))
+        url_entry = _ttk.Entry(url_frame, textvariable=self.url_var, width=60)
+        url_entry.pack(side=_tk.LEFT, fill=_tk.X, expand=True, padx=(0, 8))
 
-        test_btn = ttk.Button(url_frame, text="测试连接", command=self._on_test_connection)
-        test_btn.pack(side=tk.RIGHT)
+        test_btn = _ttk.Button(url_frame, text="测试连接", command=self._on_test_connection)
+        test_btn.pack(side=_tk.RIGHT)
 
         # --- API Key ---
-        key_frame = ttk.LabelFrame(main_frame, text="API Key（非必填）", padding=8)
-        key_frame.pack(fill=tk.X, pady=4)
+        key_frame = _ttk.LabelFrame(main_frame, text="API Key（非必填）", padding=8)
+        key_frame.pack(fill=_tk.X, pady=4)
 
-        self.key_var = tk.StringVar(value=self.config.get("api_key", ""))
-        key_entry = ttk.Entry(key_frame, textvariable=self.key_var, width=60, show="*")
-        key_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.key_var = _tk.StringVar(value=self.config.get("api_key", ""))
+        key_entry = _ttk.Entry(key_frame, textvariable=self.key_var, width=60, show="*")
+        key_entry.pack(side=_tk.LEFT, fill=_tk.X, expand=True, padx=(0, 8))
 
-        self.show_key_var = tk.BooleanVar(value=False)
-        show_key_cb = ttk.Checkbutton(key_frame, text="显示", variable=self.show_key_var,
+        self.show_key_var = _tk.BooleanVar(value=False)
+        show_key_cb = _ttk.Checkbutton(key_frame, text="显示", variable=self.show_key_var,
                                        command=lambda: key_entry.config(show="" if self.show_key_var.get() else "*"))
-        show_key_cb.pack(side=tk.RIGHT)
+        show_key_cb.pack(side=_tk.RIGHT)
 
         # --- Status / Log ---
-        log_frame = ttk.LabelFrame(main_frame, text="状态日志", padding=8)
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=4)
+        log_frame = _ttk.LabelFrame(main_frame, text="状态日志", padding=8)
+        log_frame.pack(fill=_tk.BOTH, expand=True, pady=4)
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=5, width=70,
-                                                   state=tk.DISABLED, font=("Consolas", 9))
-        self.log_text.pack(fill=tk.BOTH, expand=True)
+        self.log_text = _scrolledtext.ScrolledText(log_frame, height=5, width=70,
+                                                   state=_tk.DISABLED, font=("Consolas", 9))
+        self.log_text.pack(fill=_tk.BOTH, expand=True)
 
         # --- Buttons ---
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, pady=(8, 0))
+        btn_frame = _ttk.Frame(main_frame)
+        btn_frame.pack(fill=_tk.X, pady=(8, 0))
 
-        start_api_btn = ttk.Button(btn_frame, text="启动 copilot-api 服务", command=self._on_start_copilot_api)
-        start_api_btn.pack(side=tk.LEFT, padx=4)
+        start_api_btn = _ttk.Button(btn_frame, text="启动 copilot-api 服务", command=self._on_start_copilot_api)
+        start_api_btn.pack(side=_tk.LEFT, padx=4)
 
-        cancel_btn = ttk.Button(btn_frame, text="取消", command=self._on_cancel)
-        cancel_btn.pack(side=tk.RIGHT, padx=4)
+        cancel_btn = _ttk.Button(btn_frame, text="取消", command=self._on_cancel)
+        cancel_btn.pack(side=_tk.RIGHT, padx=4)
 
-        confirm_btn = ttk.Button(btn_frame, text="确认并保存", command=self._on_confirm)
-        confirm_btn.pack(side=tk.RIGHT, padx=4)
+        confirm_btn = _ttk.Button(btn_frame, text="确认并保存", command=self._on_confirm)
+        confirm_btn.pack(side=_tk.RIGHT, padx=4)
 
     def _log(self, msg):
-        self.log_text.config(state=tk.NORMAL)
-        self.log_text.insert(tk.END, msg + "\n")
-        self.log_text.see(tk.END)
-        self.log_text.config(state=tk.DISABLED)
+        self.log_text.config(state=_tk.NORMAL)
+        self.log_text.insert(_tk.END, msg + "\n")
+        self.log_text.see(_tk.END)
+        self.log_text.config(state=_tk.DISABLED)
 
     def _on_mt_toggle(self):
         pass  # No longer needed, multi-threading is always enabled
 
     def _on_start_copilot_api(self):
-        """Open a new terminal window and run 'copilot-api start'."""
+        """Open a new terminal window and run 'copilot-api start' (cross-platform)."""
         self._log("正在启动 copilot-api 服务 ...")
         try:
-            subprocess.Popen(
-                'start cmd /k "copilot-api start"',
-                shell=True,
-            )
+            system = platform.system()
+            if system == "Windows":
+                subprocess.Popen('start cmd /k "copilot-api start"', shell=True)
+            elif system == "Darwin":
+                # macOS: open a new Terminal.app window
+                subprocess.Popen([
+                    'osascript', '-e',
+                    'tell application "Terminal" to do script "copilot-api start"'
+                ])
+            else:
+                # Linux: try common terminal emulators
+                for term_cmd in [
+                    ['x-terminal-emulator', '-e', 'copilot-api start'],
+                    ['gnome-terminal', '--', 'copilot-api', 'start'],
+                    ['xterm', '-e', 'copilot-api start'],
+                ]:
+                    try:
+                        subprocess.Popen(term_cmd)
+                        break
+                    except FileNotFoundError:
+                        continue
+                else:
+                    self._log("✗ 未找到终端模拟器，请手动运行: copilot-api start")
+                    _messagebox.showwarning("提示", "未找到终端模拟器，请手动在终端运行:\ncopilot-api start")
+                    return
             self._log("✓ 已在新窗口启动 copilot-api start")
         except Exception as e:
             self._log(f"✗ 启动失败: {e}")
-            messagebox.showerror("启动失败", f"无法启动 copilot-api: {e}")
+            _messagebox.showerror("启动失败", f"无法启动 copilot-api: {e}")
 
     def _on_test_connection(self):
         url = self.url_var.get().strip()
         key = self.key_var.get().strip()
         if not url:
-            messagebox.showwarning("提示", "请输入 API 地址")
+            _messagebox.showwarning("提示", "请输入 API 地址")
             return
         self._log(f"正在测试连接: {url} ...")
 
@@ -298,9 +377,9 @@ class LLMConfigGUI:
             ok, msg = test_connection(url, key)
             self.root.after(0, lambda: self._log(f"{'✓' if ok else '✗'} {msg}"))
             if ok:
-                self.root.after(0, lambda: messagebox.showinfo("连接测试", msg))
+                self.root.after(0, lambda: _messagebox.showinfo("连接测试", msg))
             else:
-                self.root.after(0, lambda: messagebox.showerror("连接测试", msg))
+                self.root.after(0, lambda: _messagebox.showerror("连接测试", msg))
 
         threading.Thread(target=_do, daemon=True).start()
 
@@ -308,7 +387,7 @@ class LLMConfigGUI:
         url = self.url_var.get().strip()
         key = self.key_var.get().strip()
         if not url:
-            messagebox.showwarning("提示", "请输入 API 地址")
+            _messagebox.showwarning("提示", "请输入 API 地址")
             return
         self._log(f"正在获取模型列表 ...")
 
@@ -320,27 +399,18 @@ class LLMConfigGUI:
                 self.root.after(0, lambda: self._log(f"✓ 获取到 {len(models)} 个模型"))
             else:
                 self.root.after(0, lambda: self._log(f"✗ {result}"))
-                self.root.after(0, lambda: messagebox.showerror("获取模型", result))
+                self.root.after(0, lambda: _messagebox.showerror("获取模型", result))
 
         threading.Thread(target=_do, daemon=True).start()
 
     def _update_models(self, models):
-        self.model_combo['values'] = models
-        if models and not self.model_var.get():
-            # Auto-select first model with vision capability hints
-            vision_hints = ['gpt-4o', 'gpt-4-vision', 'claude', 'gemini', 'qwen-vl', 'glm-4v']
-            for m in models:
-                ml = m.lower()
-                if any(h in ml for h in vision_hints):
-                    self.model_var.set(m)
-                    break
-            if not self.model_var.get():
-                self.model_var.set(models[0])
+        """Legacy method — model is now fixed to gpt-4o, no combo to update."""
+        pass
 
     def _on_confirm(self):
         url = self.url_var.get().strip()
         if not url:
-            messagebox.showwarning("提示", "请输入 API 地址")
+            _messagebox.showwarning("提示", "请输入 API 地址")
             return
 
         self.config = {

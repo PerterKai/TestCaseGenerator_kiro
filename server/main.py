@@ -1027,6 +1027,10 @@ def _restore_store_from_cache():
     tc_data = _load_cache(CACHE_TESTCASES)
     if tc_data:
         testcase_store["modules"] = tc_data.get("modules", [])
+        # Normalize field names for modules loaded from cache
+        # (handles data saved before normalization was added)
+        for m in testcase_store["modules"]:
+            _normalize_module_fields(m)
 
 # ============================================================
 # Document Section Parser (for get_doc_summary / get_doc_section)
@@ -1340,8 +1344,16 @@ TOOLS = [
     },
     {
         "name": "configure_llm_api",
-        "description": "打开GUI窗口配置外部多模态LLM API，用于图片解析。支持配置API地址、API Key、测试连接、获取模型列表、选择模型、多线程设置。配置会自动保存，下次打开时恢复上次输入。用户选择'图片+文本解析'模式时调用此工具。",
-        "inputSchema": {"type": "object", "properties": {}, "required": []}
+        "description": "配置外部多模态LLM API，用于图片解析。优先尝试打开GUI窗口；如果GUI不可用（macOS/Linux headless环境），则通过参数直接配置。参数模式下必须传入 api_url，api_key 可选。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "api_url": {"type": "string", "description": "API 地址（如 http://localhost:4141/）。GUI不可用时必填。"},
+                "api_key": {"type": "string", "description": "API Key（非必填）"},
+                "test_connection": {"type": "boolean", "description": "是否测试连接（参数模式下可选，默认 true）"}
+            },
+            "required": []
+        }
     },
     {
         "name": "process_images_with_llm",
@@ -1428,7 +1440,28 @@ def handle_setup_environment(args):
                 results.append(f"  [FAIL] {label}/ — {e}")
                 all_ok = False
 
-    # 3. Check for cached tasks
+    # 3. Check GUI availability (for image processing mode)
+    gui_available = False
+    gui_reason = ""
+    try:
+        gui_path = _get_gui_module_path()
+        gui_dir = os.path.dirname(gui_path)
+        if gui_dir not in sys.path:
+            sys.path.insert(0, gui_dir)
+        from gui_llm_config import check_gui_available
+        gui_available, gui_reason = check_gui_available()
+    except Exception as e:
+        gui_reason = f"检测失败: {e}"
+
+    results.append("")
+    results.append("GUI 环境检查:")
+    if gui_available:
+        results.append("  [ok] GUI 可用（支持图片配置窗口）")
+    else:
+        results.append(f"  [info] GUI 不可用: {gui_reason}")
+        results.append("  [info] 图片模式将使用参数配置（configure_llm_api 传入 api_url 和 api_key）")
+
+    # 4. Check for cached tasks
     has_cache = False
     cache_info = {}
     existing_state = _load_cache(CACHE_PHASE_STATE)
@@ -1472,6 +1505,7 @@ def handle_setup_environment(args):
         "all_ok": all_ok,
         "has_cache": has_cache,
         "cache_info": cache_info,
+        "gui_available": gui_available,
     }
 
 
@@ -1957,6 +1991,49 @@ def handle_get_parsed_markdown(args):
     return {"content": content_parts, "file_count": len(md_files), "total_chars": total_chars}
 
 
+# ============================================================
+# Field name normalization for test case modules
+# ============================================================
+# Agent may use variant field names (e.g. "cases" instead of "test_cases",
+# "precondition" instead of "preconditions", "expected" instead of "expected_result").
+# This normalizer ensures consistent field names before storage.
+
+_SUB_MODULE_FIELD_MAP = {"cases": "test_cases", "testcases": "test_cases", "testCases": "test_cases"}
+_CASE_FIELD_MAP = {
+    "precondition": "preconditions",
+    "pre_condition": "preconditions",
+    "pre_conditions": "preconditions",
+    "expected": "expected_result",
+    "expectedResult": "expected_result",
+    "expected_results": "expected_result",
+    "step": "steps",
+}
+
+
+def _normalize_module_fields(module):
+    """Normalize variant field names in a module to canonical names."""
+    for sub in module.get("sub_modules", []):
+        # Normalize sub_module level: "cases" → "test_cases"
+        for old_key, new_key in _SUB_MODULE_FIELD_MAP.items():
+            if old_key in sub and new_key not in sub:
+                sub[new_key] = sub.pop(old_key)
+            elif old_key in sub and new_key in sub:
+                # Both exist — merge (old into new), remove old
+                sub[new_key].extend(sub.pop(old_key))
+
+        # Normalize case level fields
+        for case in sub.get("test_cases", []):
+            for old_key, new_key in _CASE_FIELD_MAP.items():
+                if old_key in case and new_key not in case:
+                    case[new_key] = case.pop(old_key)
+                elif old_key in case:
+                    del case[old_key]  # new_key already exists, drop duplicate
+
+            # Ensure steps is a list
+            if isinstance(case.get("steps"), str):
+                case["steps"] = [s.strip() for s in case["steps"].split("\n") if s.strip()]
+
+
 def handle_save_testcases(args):
     modules = args.get("modules", None)
     append_module = args.get("append_module", None)
@@ -2006,6 +2083,9 @@ def handle_save_testcases(args):
         if "sub_modules" not in append_module:
             append_module["sub_modules"] = []
 
+        # Normalize field names (agent may use variant names)
+        _normalize_module_fields(append_module)
+
         # Incremental: append one module (replace if same name exists)
         if not testcase_store["modules"]:
             _restore_store_from_cache()
@@ -2054,6 +2134,7 @@ def handle_save_testcases(args):
             return {"content": [{"type": "text", "text": f"Error: modules[{i}] must have a 'name' field."}]}
         if "sub_modules" not in m:
             m["sub_modules"] = []
+        _normalize_module_fields(m)
 
     testcase_store["modules"] = modules
     _sync_store_to_cache()
@@ -2742,13 +2823,81 @@ def _get_gui_module_path():
 
 
 def handle_configure_llm_api(args):
-    """Launch GUI for configuring external LLM API."""
+    """Launch GUI for configuring external LLM API, with headless fallback."""
     workspace = _workspace()
     gui_path = _get_gui_module_path()
 
     if not os.path.exists(gui_path):
         return {"content": [{"type": "text", "text": f"错误: GUI 模块未找到: {gui_path}"}]}
 
+    # Import check_gui_available from gui module
+    gui_dir = os.path.dirname(gui_path)
+    if gui_dir not in sys.path:
+        sys.path.insert(0, gui_dir)
+    try:
+        from gui_llm_config import check_gui_available, load_config, save_config, test_connection
+    except ImportError as e:
+        return {"content": [{"type": "text", "text": f"错误: 无法导入 GUI 模块: {e}"}]}
+
+    gui_ok, gui_reason = check_gui_available()
+
+    # --- Headless fallback: configure via parameters ---
+    api_url = args.get("api_url", "").strip()
+    api_key = args.get("api_key", "").strip()
+    do_test = args.get("test_connection", True)
+
+    if not gui_ok or api_url:
+        # Parameter mode (forced by GUI unavailability or explicit params)
+        if not api_url:
+            # No params and no GUI — tell agent to pass params
+            existing = load_config(workspace)
+            existing_url = existing.get("api_url", "")
+            msg_lines = [
+                f"⚠️ GUI 不可用: {gui_reason}",
+                "",
+                "请使用参数模式配置，调用:",
+                '  configure_llm_api(api_url="http://your-api-url/", api_key="your-key")',
+                "",
+            ]
+            if existing_url:
+                msg_lines.append(f"当前已有配置: api_url={existing_url}, model={existing.get('model', 'gpt-4o')}")
+                msg_lines.append("如需沿用当前配置，请传入相同的 api_url 即可。")
+            return {
+                "content": [{"type": "text", "text": "\n".join(msg_lines)}],
+                "gui_available": False,
+                "needs_params": True,
+            }
+
+        # Save config from params
+        config = {
+            "api_url": api_url,
+            "api_key": api_key,
+            "model": "gpt-4o",
+            "enable_multithreading": True,
+            "max_threads": 8,
+        }
+
+        # Optionally test connection
+        test_msg = ""
+        if do_test:
+            ok, msg = test_connection(api_url, api_key)
+            test_msg = f"\n  连接测试: {'✓ ' + msg if ok else '✗ ' + msg}"
+
+        save_config(config, workspace)
+        msg_lines = [
+            "✓ LLM API 配置已保存（参数模式）:",
+            f"  API 地址: {api_url}",
+            f"  API Key: {'已设置' if api_key else '未设置'}",
+            f"  模型: gpt-4o",
+            f"  多线程: 启用 (8 线程)",
+        ]
+        if test_msg:
+            msg_lines.append(test_msg)
+        msg_lines.append("")
+        msg_lines.append("配置完成，可以调用 process_images_with_llm 开始处理图片。")
+        return {"content": [{"type": "text", "text": "\n".join(msg_lines)}], "config": config}
+
+    # --- GUI mode ---
     try:
         result = subprocess.run(
             [sys.executable, gui_path, workspace],
@@ -2757,7 +2906,6 @@ def handle_configure_llm_api(args):
             encoding='utf-8', errors='replace'
         )
         if result.returncode == 0:
-            # Parse the config from stdout
             try:
                 config = json.loads(result.stdout.strip())
                 msg_lines = [
@@ -2775,11 +2923,21 @@ def handle_configure_llm_api(args):
         else:
             if "Cancelled" in (result.stdout or ""):
                 return {"content": [{"type": "text", "text": "用户取消了配置。"}]}
-            return {"content": [{"type": "text", "text": f"GUI 配置失败 (exit {result.returncode}): {result.stderr[:500]}"}]}
+            # GUI failed at runtime — fall back to param mode hint
+            stderr_snippet = (result.stderr or "")[:300]
+            return {"content": [{"type": "text", "text": (
+                f"GUI 启动失败 (exit {result.returncode}): {stderr_snippet}\n\n"
+                "请改用参数模式配置:\n"
+                '  configure_llm_api(api_url="http://your-api-url/", api_key="your-key")'
+            )}], "gui_available": False, "needs_params": True}
     except subprocess.TimeoutExpired:
         return {"content": [{"type": "text", "text": "配置窗口超时（5分钟），请重新调用 configure_llm_api。"}]}
     except Exception as e:
-        return {"content": [{"type": "text", "text": f"启动配置窗口失败: {e}"}]}
+        return {"content": [{"type": "text", "text": (
+            f"启动配置窗口失败: {e}\n\n"
+            "请改用参数模式配置:\n"
+            '  configure_llm_api(api_url="http://your-api-url/", api_key="your-key")'
+        )}], "gui_available": False, "needs_params": True}
 
 
 def _process_single_image(img_info, api_url, api_key, model, prompt):
@@ -3068,7 +3226,7 @@ def handle_request(req):
         send_response(rid, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "testcase-generator", "version": "7.0.0"}
+            "serverInfo": {"name": "testcase-generator", "version": "1.6.1"}
         })
     elif method == "notifications/initialized":
         pass  # No response needed for notifications
