@@ -26,6 +26,9 @@ from xml.etree import ElementTree as ET
 
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
+# Power version — used in MCP server info and JSON reports
+POWER_VERSION = "1.6.1"
+
 # ============================================================
 # Auto-install helper
 # ============================================================
@@ -2685,7 +2688,7 @@ def handle_export_json_report(args):
     iteration_feedbacks = _load_cache(CACHE_ITERATION_FEEDBACKS, [])
 
     report = {
-        "report_version": "1.1",
+        "report_version": POWER_VERSION,
         "report_id": f"{req_name}_{report_ts}",
         "generated_at": datetime.datetime.now().isoformat(timespec='seconds'),
         "iteration_count": iteration_count,
@@ -3226,7 +3229,7 @@ def handle_request(req):
         send_response(rid, {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "testcase-generator", "version": "1.6.1"}
+            "serverInfo": {"name": "testcase-generator", "version": POWER_VERSION}
         })
     elif method == "notifications/initialized":
         pass  # No response needed for notifications
