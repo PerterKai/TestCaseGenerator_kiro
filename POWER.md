@@ -27,10 +27,10 @@ keywords:
 - 文档中的图片提取到 `.tmp/picture/` 目录，每张图片有唯一标识
 - 内嵌 Excel 电子表格自动解析为 markdown 表格，跳过预览图片
 - Markdown 文件中用 `{{IMG:唯一标识}}` 占位符标记图片原始位置
-- 图片通过外部多模态 LLM API 批量分析（支持多线程并发）
+- 图片通过 copilot-api (GitHub Copilot) 调用 gpt-4o 批量分析（支持多线程并发）
 - 分析结果直接写回 Markdown 文件，替换对应占位符
 - 所有工作流状态持久化到 `.tmp/cache/` 目录，支持跨 session 恢复
-- 外部LLM配置通过GUI窗口或参数模式完成（macOS/Linux headless 环境自动降级为参数模式），配置持久化到 `.tmp/cache/llm_api_config.json`
+- 外部LLM通过 copilot-api 自动配置（检查安装→启动服务→检查登录→自动获取API地址），配置持久化到 `.tmp/cache/llm_api_config.json`
 
 ## 工作流程（分阶段，支持跨 session）
 
@@ -43,7 +43,7 @@ keywords:
    - `.tmp/doc_mk/` — 转换后的 Markdown 文件
    - `.tmp/picture/` — 提取的图片文件
    - `.tmp/cache/` — 工作流状态缓存
-3. **GUI 环境检查**: 检测 tkinter 和显示环境是否可用，返回 `gui_available` 字段
+3. **copilot-api 检查**: 轻量检测 copilot-api 是否已安装（启动和登录检查在用户选择图片模式后由 `configure_llm_api` 执行）
 4. **缓存任务检测**: 检查是否存在未完成的缓存任务
 
 #### 缓存任务处理逻辑
@@ -91,10 +91,10 @@ keywords:
 向用户说明两种模式并让用户选择：
 
 > 请选择用例生成模式：
-> 1. **文档+图片模式**（需调用外部多模态LLM API，高token消耗）— 解析文档文字和图片，图片通过外部多模态LLM API分析（如GPT-4o、Claude等），支持多线程并发
+> 1. **文档+图片模式**（通过 copilot-api 调用 gpt-4o，高token消耗）— 解析文档文字和图片，图片通过 copilot-api 调用 gpt-4o 分析，支持多线程并发
 > 2. **纯文档模式**（低token消耗）— 仅解析文档文字内容，跳过图片分析
 
-- 用户选择"文档+图片模式" → 执行步骤 2，然后配置外部API（GUI可用时打开GUI窗口，不可用时通过参数配置），配置完成后调用 `process_images_with_llm` 批量处理
+- 用户选择"文档+图片模式" → 执行步骤 2，然后调用 `configure_llm_api` 自动配置 copilot-api（检查安装→启动→登录→获取API地址），配置完成后调用 `process_images_with_llm` 批量处理
 - 用户选择"纯文档模式" → 执行步骤 2 后跳过步骤 3，直接进入步骤 4
 
 ### 步骤 2: 解析文档 → Markdown + 图片
@@ -106,10 +106,12 @@ keywords:
 
 ### 步骤 3: 图片处理（仅"文档+图片模式"）
 
-1. 调用 `configure_llm_api` 配置外部 API
-   - **GUI 可用时**（`setup_environment` 返回 `gui_available=true`）：自动打开 GUI 配置窗口
-   - **GUI 不可用时**（macOS/Linux headless 环境）：通过参数配置，调用 `configure_llm_api(api_url="http://...", api_key="...")`
-   - 向用户询问 API 地址和 API Key，然后传入参数完成配置
+1. 调用 `configure_llm_api` 配置 copilot-api
+   - 自动检查 copilot-api 是否已安装（未安装则提示 `npm install -g copilot-api`）
+   - 自动启动 copilot-api 服务
+   - 检查登录状态：未登录时提取登录码，告知用户找蔡逸凡进行 Copilot 登录授权
+   - 已登录则自动获取 API 地址（默认 http://localhost:4141），使用 gpt-4o 模型
+   - 也支持通过 `api_url` 参数手动指定其他 API 地址
    - 配置自动持久化，下次恢复
 2. 调用 `process_images_with_llm` 批量处理所有待处理图片
    - 如启用多线程，将并发调用外部LLM处理多张图片

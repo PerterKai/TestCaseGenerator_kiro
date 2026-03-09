@@ -32,7 +32,7 @@ cos_strategy_prefix: Testcase_reports/
 ### 阶段0: 环境检查与任务决策（每次启动必做）
 
 1. 调用 `setup_environment` 执行启动检查
-2. 工具自动完成：依赖检查 → 目录创建 → GUI 环境检查 → 缓存任务检测
+2. 工具自动完成：依赖检查 → 目录创建 → copilot-api 环境检查 → 缓存任务检测
 3. 根据返回结果决定后续流程：
 
 **如果 `has_cache=true`（检测到缓存任务）：**
@@ -71,10 +71,10 @@ cos_strategy_prefix: Testcase_reports/
 
 | 模式 | 说明 | tokens 消耗 |
 |------|------|-------------|
-| 文档+图片模式 | 解析文字+图片，图片通过外部多模态LLM API分析，支持多线程 | 高（使用外部API） |
+| 文档+图片模式 | 解析文字+图片，图片通过 copilot-api (gpt-4o) 分析，支持多线程 | 高（使用 copilot-api） |
 | 纯文档模式 | 仅解析文字内容，跳过图片分析 | 低 |
 
-- 用户选择"文档+图片模式" → 执行阶段2，然后调用 `configure_llm_api` 配置外部API（GUI可用时打开GUI窗口，不可用时通过参数配置），配置完成后调用 `process_images_with_llm` 批量处理图片
+- 用户选择"文档+图片模式" → 执行阶段2，然后调用 `configure_llm_api` 自动配置 copilot-api（检查安装→启动→登录→获取API地址），配置完成后调用 `process_images_with_llm` 批量处理图片
 - 用户选择"纯文档模式" → 执行阶段2，跳过阶段2.5，直接进入阶段3
 
 ### 阶段2: 文档转换
@@ -85,19 +85,15 @@ cos_strategy_prefix: Testcase_reports/
 
 ### 阶段2.5: 图片处理（仅"文档+图片模式"）
 
-1. 调用 `configure_llm_api` 配置外部 API
-   - **GUI 可用时**（`setup_environment` 返回 `gui_available=true`）：自动打开 GUI 配置窗口
-     - 输入API地址（如 http://localhost:4141/）
-     - 输入API Key（非必填）
-     - 点击"测试连接"验证连通性
-     - 点击"确认并保存"
-   - **GUI 不可用时**（macOS/Linux headless 环境）：通过参数配置
-     - 向用户询问 API 地址和 API Key
-     - 调用 `configure_llm_api(api_url="http://...", api_key="...")` 完成配置
-     - 工具会自动测试连接并保存配置
+1. 调用 `configure_llm_api` 配置 copilot-api
+   - 自动检查 copilot-api 是否已安装（未安装则提示 `npm install -g copilot-api`）
+   - 自动启动 copilot-api 服务
+   - 检查登录状态：未登录时提取登录码，告知用户找蔡逸凡进行 Copilot 登录授权
+   - 已登录则自动获取 API 地址（默认 http://localhost:4141），使用 gpt-4o 模型
+   - 也支持通过 `api_url` 参数手动指定其他 API 地址
    - 配置会自动保存，下次打开时恢复上次输入
 2. 调用 `process_images_with_llm` 批量处理所有待处理图片
-   - 支持多线程并发（如已在GUI中启用）
+   - 支持多线程并发（默认8线程）
    - 自动将分析结果回填到Markdown文档对应位置
    - 如果图片因清晰度不足导致模型无法准确解析，该图片会被自动跳过，不影响后续流程
    - 处理进度自动持久化，支持断点续传

@@ -40,7 +40,7 @@ pip install python-docx Pillow openpyxl
 ├── server/                  # MCP Server 实现
 │   ├── main.py              # MCP Server 主程序（全部工具实现）
 │   ├── launcher.py           # MCP Server 启动器（自动定位 main.py）
-│   └── gui_llm_config.py    # 外部 LLM API 配置 GUI（tkinter）
+│   └── copilot_api_helper.py  # copilot-api 集成（LLM API 配置与调用）
 ├── requirements.txt         # Python 依赖
 └── README.md
 ```
@@ -48,7 +48,7 @@ pip install python-docx Pillow openpyxl
 ## 工作流程
 
 1. **文档解析** — 将 .docx 转为 Markdown，提取图片
-2. **图片分析** — 通过外部多模态 LLM API 逐张分析图片内容（表格、流程图、接口定义等）
+2. **图片分析** — 通过 copilot-api (gpt-4o) 逐张分析图片内容（表格、流程图、接口定义等）
 3. **用例生成** — 按模块分段读取文档，生成测试用例
 4. **模块审查** — 审查模块划分合理性，优化结构
 5. **自动 Review** — 多轮迭代审查用例质量

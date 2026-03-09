@@ -3,7 +3,7 @@
 Test Case Generator MCP Server v7.0
 - Phase-based workflow with file cache for cross-session resume
 - Splits document reading into summary + sections to reduce context
-- External multimodal LLM API support with GUI configuration
+- External multimodal LLM API support via copilot-api
 - Multi-threaded image processing
 - Improved image extraction (VML, OLE, orphan detection)
 - All state persisted to .tmp/cache/ for recovery
@@ -1196,7 +1196,7 @@ def create_xmind_file(modules, output_path):
 TOOLS = [
     {
         "name": "setup_environment",
-        "description": "启动检查: 1) 检查并安装Python依赖 2) 检查并创建工作目录(doc/, .tmp/doc_mk/, .tmp/picture/, .tmp/cache/) 3) 检测缓存任务。如检测到缓存任务，返回 has_cache=true 和缓存详情，agent 需询问用户是继续上次任务还是开始新任务。",
+        "description": "启动检查: 1) 检查并安装Python依赖 2) 检查并创建工作目录(doc/, .tmp/doc_mk/, .tmp/picture/, .tmp/cache/) 3) 轻量检测copilot-api是否已安装 4) 检测缓存任务。如检测到缓存任务，返回 has_cache=true 和缓存详情，agent 需询问用户是继续上次任务还是开始新任务。",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
@@ -1347,20 +1347,20 @@ TOOLS = [
     },
     {
         "name": "configure_llm_api",
-        "description": "配置外部多模态LLM API，用于图片解析。优先尝试打开GUI窗口；如果GUI不可用（macOS/Linux headless环境），则通过参数直接配置。参数模式下必须传入 api_url，api_key 可选。",
+        "description": "配置外部多模态LLM API，用于图片解析。自动检查copilot-api安装→启动服务→检查登录状态→获取API地址。未登录时提取登录码告知用户找蔡逸凡进行Copilot登录。已登录则自动配置API地址，默认使用gpt-4o模型。也支持通过api_url参数手动指定API地址。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "api_url": {"type": "string", "description": "API 地址（如 http://localhost:4141/）。GUI不可用时必填。"},
-                "api_key": {"type": "string", "description": "API Key（非必填）"},
-                "test_connection": {"type": "boolean", "description": "是否测试连接（参数模式下可选，默认 true）"}
+                "api_url": {"type": "string", "description": "手动指定API地址（可选，默认自动通过copilot-api获取）"},
+                "api_key": {"type": "string", "description": "API Key（非必填，copilot-api模式不需要）"},
+                "test_connection": {"type": "boolean", "description": "是否测试连接（手动指定api_url时可选，默认 true）"}
             },
             "required": []
         }
     },
     {
         "name": "process_images_with_llm",
-        "description": "使用已配置的外部多模态LLM API批量处理所有待处理图片。支持多线程并发。需先调用configure_llm_api配置API。处理完成后自动将分析结果回填到Markdown文档对应位置。",
+        "description": "使用已配置的外部多模态LLM API(copilot-api/gpt-4o)批量处理所有待处理图片。支持多线程并发。需先调用configure_llm_api配置API。处理完成后自动将分析结果回填到Markdown文档对应位置。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1443,26 +1443,29 @@ def handle_setup_environment(args):
                 results.append(f"  [FAIL] {label}/ — {e}")
                 all_ok = False
 
-    # 3. Check GUI availability (for image processing mode)
-    gui_available = False
-    gui_reason = ""
+    # 3. Check copilot-api installation (lightweight check only)
+    # Full startup + login check happens in configure_llm_api when user chooses image mode
+    copilot_installed = False
+    copilot_info = ""
     try:
-        gui_path = _get_gui_module_path()
-        gui_dir = os.path.dirname(gui_path)
-        if gui_dir not in sys.path:
-            sys.path.insert(0, gui_dir)
-        from gui_llm_config import check_gui_available
-        gui_available, gui_reason = check_gui_available()
+        helper_path = _get_copilot_helper_path()
+        helper_dir = os.path.dirname(helper_path)
+        if helper_dir not in sys.path:
+            sys.path.insert(0, helper_dir)
+        from copilot_api_helper import check_copilot_api_installed
+        copilot_installed, install_info = check_copilot_api_installed()
+        if not copilot_installed:
+            copilot_info = install_info
     except Exception as e:
-        gui_reason = f"检测失败: {e}"
+        copilot_info = f"检测失败: {e}"
 
     results.append("")
-    results.append("GUI 环境检查:")
-    if gui_available:
-        results.append("  [ok] GUI 可用（支持图片配置窗口）")
+    results.append("copilot-api 环境检查:")
+    if copilot_installed:
+        results.append("  [ok] copilot-api 已安装")
     else:
-        results.append(f"  [info] GUI 不可用: {gui_reason}")
-        results.append("  [info] 图片模式将使用参数配置（configure_llm_api 传入 api_url 和 api_key）")
+        results.append(f"  [warn] {copilot_info}")
+        results.append("  [info] 图片模式需先安装最新版 Node.js，然后运行: npm install -g copilot-api")
 
     # 4. Check for cached tasks
     has_cache = False
@@ -1508,7 +1511,7 @@ def handle_setup_environment(args):
         "all_ok": all_ok,
         "has_cache": has_cache,
         "cache_info": cache_info,
-        "gui_available": gui_available,
+        "copilot_installed": copilot_installed,
     }
 
 
@@ -1702,7 +1705,7 @@ def handle_parse_documents(args):
                 f"  缓存目录: {TMP_CACHE_DIR}\n")
     if total_imgs > 0:
         summary += ("\n图片处理：\n"
-                    "  调用 configure_llm_api 配置外部多模态LLM API，然后调用 process_images_with_llm 批量处理\n"
+                    "  调用 configure_llm_api 配置 copilot-api，然后调用 process_images_with_llm 批量处理\n"
                     "全部处理完成后调用 get_doc_summary 获取文档结构概览。")
     else:
         summary += "\n无需处理图片，可直接调用 get_doc_summary 获取文档结构概览。"
@@ -1793,7 +1796,7 @@ def handle_get_workflow_state(args):
 
     if has_unprocessed_images:
         lines.append(f"▶ 继续操作: 有 {unprocessed_imgs} 张图片待处理")
-        lines.append("  - 调用 configure_llm_api + process_images_with_llm 使用外部LLM批量处理")
+        lines.append("  - 调用 configure_llm_api + process_images_with_llm 使用 copilot-api (gpt-4o) 批量处理")
     elif not img_completed and total_imgs > 0:
         lines.append("▶ 继续操作: 调用 process_images_with_llm 检查图片处理状态")
     elif (img_completed or total_imgs == 0) and not has_testcases:
@@ -2610,10 +2613,10 @@ def handle_export_json_report(args):
     # Load LLM config
     llm_config_info = {}
     try:
-        gui_dir = os.path.dirname(os.path.abspath(__file__))
-        if gui_dir not in sys.path:
-            sys.path.insert(0, gui_dir)
-        from gui_llm_config import load_config as load_llm_config
+        helper_dir = os.path.dirname(os.path.abspath(__file__))
+        if helper_dir not in sys.path:
+            sys.path.insert(0, helper_dir)
+        from copilot_api_helper import load_config as load_llm_config
         config = load_llm_config(_workspace())
         llm_config_info = {
             "api_url": config.get("api_url", ""),
@@ -2820,77 +2823,55 @@ def handle_record_iteration_feedback(args):
 # External LLM Image Processing Handlers
 # ============================================================
 
+def _get_copilot_helper_path():
+    """Get the path to copilot_api_helper.py relative to this file."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "copilot_api_helper.py")
+
+
 def _get_gui_module_path():
-    """Get the path to gui_llm_config.py relative to this file."""
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_llm_config.py")
+    """Legacy alias — now points to copilot_api_helper.py."""
+    return _get_copilot_helper_path()
 
 
 def handle_configure_llm_api(args):
-    """Launch GUI for configuring external LLM API, with headless fallback."""
+    """Configure LLM API via copilot-api: check install, start service, check login, auto-configure."""
     workspace = _workspace()
-    gui_path = _get_gui_module_path()
 
-    if not os.path.exists(gui_path):
-        return {"content": [{"type": "text", "text": f"错误: GUI 模块未找到: {gui_path}"}]}
-
-    # Import check_gui_available from gui module
-    gui_dir = os.path.dirname(gui_path)
-    if gui_dir not in sys.path:
-        sys.path.insert(0, gui_dir)
+    helper_dir = os.path.dirname(os.path.abspath(__file__))
+    if helper_dir not in sys.path:
+        sys.path.insert(0, helper_dir)
     try:
-        from gui_llm_config import check_gui_available, load_config, save_config, test_connection
+        from copilot_api_helper import (
+            check_copilot_api_installed, check_copilot_api_running,
+            start_copilot_api, test_connection, load_config, save_config,
+            DEFAULT_COPILOT_API_URL
+        )
     except ImportError as e:
-        return {"content": [{"type": "text", "text": f"错误: 无法导入 GUI 模块: {e}"}]}
+        return {"content": [{"type": "text", "text": f"错误: 无法导入 copilot_api_helper: {e}"}]}
 
-    gui_ok, gui_reason = check_gui_available()
-
-    # --- Headless fallback: configure via parameters ---
-    api_url = args.get("api_url", "").strip()
-    api_key = args.get("api_key", "").strip()
+    # Allow explicit api_url override (backward compat / advanced usage)
+    explicit_url = args.get("api_url", "").strip()
+    explicit_key = args.get("api_key", "").strip()
     do_test = args.get("test_connection", True)
 
-    if not gui_ok or api_url:
-        # Parameter mode (forced by GUI unavailability or explicit params)
-        if not api_url:
-            # No params and no GUI — tell agent to pass params
-            existing = load_config(workspace)
-            existing_url = existing.get("api_url", "")
-            msg_lines = [
-                f"⚠️ GUI 不可用: {gui_reason}",
-                "",
-                "请使用参数模式配置，调用:",
-                '  configure_llm_api(api_url="http://your-api-url/", api_key="your-key")',
-                "",
-            ]
-            if existing_url:
-                msg_lines.append(f"当前已有配置: api_url={existing_url}, model={existing.get('model', 'gpt-4o')}")
-                msg_lines.append("如需沿用当前配置，请传入相同的 api_url 即可。")
-            return {
-                "content": [{"type": "text", "text": "\n".join(msg_lines)}],
-                "gui_available": False,
-                "needs_params": True,
-            }
-
-        # Save config from params
+    if explicit_url:
+        # Direct parameter mode — user provided explicit URL
         config = {
-            "api_url": api_url,
-            "api_key": api_key,
+            "api_url": explicit_url,
+            "api_key": explicit_key,
             "model": "gpt-4o",
             "enable_multithreading": True,
             "max_threads": 8,
         }
-
-        # Optionally test connection
         test_msg = ""
         if do_test:
-            ok, msg = test_connection(api_url, api_key)
+            ok, msg = test_connection(explicit_url, explicit_key)
             test_msg = f"\n  连接测试: {'✓ ' + msg if ok else '✗ ' + msg}"
-
         save_config(config, workspace)
         msg_lines = [
-            "✓ LLM API 配置已保存（参数模式）:",
-            f"  API 地址: {api_url}",
-            f"  API Key: {'已设置' if api_key else '未设置'}",
+            "✓ LLM API 配置已保存（手动指定模式）:",
+            f"  API 地址: {explicit_url}",
+            f"  API Key: {'已设置' if explicit_key else '未设置'}",
             f"  模型: gpt-4o",
             f"  多线程: 启用 (8 线程)",
         ]
@@ -2900,47 +2881,93 @@ def handle_configure_llm_api(args):
         msg_lines.append("配置完成，可以调用 process_images_with_llm 开始处理图片。")
         return {"content": [{"type": "text", "text": "\n".join(msg_lines)}], "config": config}
 
-    # --- GUI mode ---
-    try:
-        result = subprocess.run(
-            [sys.executable, gui_path, workspace],
-            stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=300,
-            encoding='utf-8', errors='replace'
-        )
-        if result.returncode == 0:
-            try:
-                config = json.loads(result.stdout.strip())
-                msg_lines = [
-                    "✓ LLM API 配置已保存:",
-                    f"  API 地址: {config.get('api_url', '')}",
-                    f"  API Key: {'已设置' if config.get('api_key') else '未设置'}",
-                    f"  模型: {config.get('model', '')}",
-                    f"  多线程: {'启用 (' + str(config.get('max_threads', 3)) + ' 线程)' if config.get('enable_multithreading') else '禁用'}",
-                    "",
-                    "配置完成，可以调用 process_images_with_llm 开始处理图片。"
-                ]
-                return {"content": [{"type": "text", "text": "\n".join(msg_lines)}], "config": config}
-            except json.JSONDecodeError:
-                return {"content": [{"type": "text", "text": f"GUI 输出解析失败: {result.stdout[:500]}"}]}
-        else:
-            if "Cancelled" in (result.stdout or ""):
-                return {"content": [{"type": "text", "text": "用户取消了配置。"}]}
-            # GUI failed at runtime — fall back to param mode hint
-            stderr_snippet = (result.stderr or "")[:300]
-            return {"content": [{"type": "text", "text": (
-                f"GUI 启动失败 (exit {result.returncode}): {stderr_snippet}\n\n"
-                "请改用参数模式配置:\n"
-                '  configure_llm_api(api_url="http://your-api-url/", api_key="your-key")'
-            )}], "gui_available": False, "needs_params": True}
-    except subprocess.TimeoutExpired:
-        return {"content": [{"type": "text", "text": "配置窗口超时（5分钟），请重新调用 configure_llm_api。"}]}
-    except Exception as e:
+    # --- copilot-api auto-config flow ---
+    msg_lines = []
+
+    # Step 1: Check if copilot-api is installed
+    installed, install_info = check_copilot_api_installed()
+    if not installed:
         return {"content": [{"type": "text", "text": (
-            f"启动配置窗口失败: {e}\n\n"
-            "请改用参数模式配置:\n"
-            '  configure_llm_api(api_url="http://your-api-url/", api_key="your-key")'
-        )}], "gui_available": False, "needs_params": True}
+            "✗ copilot-api 未安装\n\n"
+            "请先安装最新版 Node.js (https://nodejs.org/)，然后运行:\n"
+            "  npm install -g copilot-api\n\n"
+            "安装完成后重新调用 configure_llm_api。"
+        )}], "copilot_installed": False}
+
+    msg_lines.append(f"✓ copilot-api 已安装: {install_info}")
+
+    # Step 2: Check if service is already running
+    running, run_msg = check_copilot_api_running()
+    if running:
+        msg_lines.append(f"✓ copilot-api 服务已运行")
+        # Save config and return
+        api_url = DEFAULT_COPILOT_API_URL
+        config = {
+            "api_url": api_url,
+            "api_key": "",
+            "model": "gpt-4o",
+            "enable_multithreading": True,
+            "max_threads": 8,
+        }
+        save_config(config, workspace)
+        msg_lines.extend([
+            f"  API 地址: {api_url}",
+            "  模型: gpt-4o",
+            "  多线程: 启用 (8 线程)",
+            "",
+            "配置完成，可以调用 process_images_with_llm 开始处理图片。"
+        ])
+        return {"content": [{"type": "text", "text": "\n".join(msg_lines)}], "config": config}
+
+    # Step 3: Start copilot-api
+    msg_lines.append("正在启动 copilot-api 服务...")
+    ok, start_msg, proc = start_copilot_api()
+
+    if ok:
+        msg_lines.append("✓ copilot-api 服务已启动")
+        api_url = DEFAULT_COPILOT_API_URL
+        config = {
+            "api_url": api_url,
+            "api_key": "",
+            "model": "gpt-4o",
+            "enable_multithreading": True,
+            "max_threads": 8,
+        }
+        save_config(config, workspace)
+        msg_lines.extend([
+            f"  API 地址: {api_url}",
+            "  模型: gpt-4o",
+            "  多线程: 启用 (8 线程)",
+            "",
+            "配置完成，可以调用 process_images_with_llm 开始处理图片。"
+        ])
+        return {"content": [{"type": "text", "text": "\n".join(msg_lines)}], "config": config}
+
+    # Step 4: Handle login requirement
+    if start_msg.startswith("NEED_LOGIN:"):
+        parts = start_msg.split(":", 2)
+        login_code = parts[1] if len(parts) > 1 else "未知"
+        login_url = parts[2] if len(parts) > 2 and parts[2] else "https://github.com/login/device"
+        return {
+            "content": [{"type": "text", "text": (
+                "⚠️ copilot-api 需要登录 GitHub Copilot\n\n"
+                f"  登录码: {login_code}\n"
+                f"  登录地址: {login_url}\n\n"
+                "请找蔡逸凡进行 Copilot 登录授权，将上面的登录码提供给他。\n"
+                "登录完成后，重新调用 configure_llm_api 继续配置。"
+            )}],
+            "need_login": True,
+            "login_code": login_code,
+            "login_url": login_url,
+        }
+
+    # Other startup failure
+    return {"content": [{"type": "text", "text": (
+        f"✗ copilot-api 启动失败:\n{start_msg}\n\n"
+        "请检查 copilot-api 安装和网络状态后重试。\n"
+        "也可以手动启动后传入 API 地址:\n"
+        '  configure_llm_api(api_url="http://localhost:4141/")'
+    )}]}
 
 
 def _process_single_image(img_info, api_url, api_key, model, prompt):
@@ -2974,11 +3001,11 @@ def _process_single_image(img_info, api_url, api_key, model, prompt):
 
         b64 = base64.b64encode(img_data).decode('ascii')
 
-        # Import from gui module
+        # Import from copilot_api_helper module
         gui_dir = os.path.dirname(os.path.abspath(__file__))
         if gui_dir not in sys.path:
             sys.path.insert(0, gui_dir)
-        from gui_llm_config import call_llm_vision
+        from copilot_api_helper import call_llm_vision
 
         ok, result, token_usage = call_llm_vision(api_url, api_key, model, b64, mime, prompt, timeout=120)
         if not ok:
@@ -3048,10 +3075,10 @@ def handle_process_images_with_llm(args):
     force_reprocess = args.get("force_reprocess", False)
 
     # Load LLM config
-    gui_dir = os.path.dirname(os.path.abspath(__file__))
-    if gui_dir not in sys.path:
-        sys.path.insert(0, gui_dir)
-    from gui_llm_config import load_config as load_llm_config
+    helper_dir = os.path.dirname(os.path.abspath(__file__))
+    if helper_dir not in sys.path:
+        sys.path.insert(0, helper_dir)
+    from copilot_api_helper import load_config as load_llm_config
 
     config = load_llm_config(_workspace())
     api_url = config.get("api_url", "")
@@ -3062,7 +3089,7 @@ def handle_process_images_with_llm(args):
 
     if not api_url:
         return {"content": [{"type": "text", "text": (
-            "未配置外部 LLM API。请先调用 configure_llm_api 打开配置窗口。"
+            "未配置外部 LLM API。请先调用 configure_llm_api 配置 copilot-api。"
         )}]}
 
     # Get pending images
