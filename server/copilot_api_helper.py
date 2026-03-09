@@ -94,34 +94,139 @@ def _http_request(url, method="GET", data=None, headers=None, timeout=15):
 def check_copilot_api_installed():
     """Check if copilot-api CLI is installed. Also checks Node.js prerequisite.
     Returns (installed: bool, path_or_error: str).
+    
+    Searches both PATH and common installation directories to handle
+    environments where PATH is incomplete (e.g., MCP server subprocess,
+    nvm/fnm managed Node.js, GUI-launched processes on macOS).
     """
-    which_cmd = "where" if sys.platform == "win32" else "which"
+    
+    def _find_executable(name):
+        """Find an executable by name. Tries PATH first, then common locations."""
+        which_cmd = "where" if sys.platform == "win32" else "which"
+        
+        # 1. Try standard PATH lookup
+        try:
+            result = subprocess.run(
+                [which_cmd, name],
+                capture_output=True, text=True, timeout=10,
+                encoding='utf-8', errors='replace'
+            )
+            if result.returncode == 0:
+                path = result.stdout.strip().split('\n')[0].strip()
+                if path:
+                    return path
+        except Exception:
+            pass
+        
+        # 2. Try running directly (may work if shell profile sets PATH)
+        try:
+            result = subprocess.run(
+                [name, "--version"],
+                capture_output=True, text=True, timeout=10,
+                encoding='utf-8', errors='replace'
+            )
+            if result.returncode == 0:
+                return name  # Found in some PATH
+        except Exception:
+            pass
+        
+        # 3. Search common installation directories
+        home = os.path.expanduser("~")
+        common_dirs = []
+        
+        if sys.platform == "darwin":
+            # macOS common locations
+            common_dirs = [
+                "/usr/local/bin",
+                "/opt/homebrew/bin",                          # Apple Silicon Homebrew
+                os.path.join(home, ".nvm/versions/node"),     # nvm (search subdirs)
+                os.path.join(home, ".fnm/node-versions"),     # fnm (search subdirs)
+                os.path.join(home, ".local/share/fnm/node-versions"),  # fnm alt
+                os.path.join(home, ".volta/bin"),              # volta
+                os.path.join(home, ".npm-global/bin"),         # npm global custom
+                "/usr/local/lib/node_modules/.bin",
+            ]
+        elif sys.platform != "win32":
+            # Linux common locations
+            common_dirs = [
+                "/usr/local/bin",
+                "/usr/bin",
+                os.path.join(home, ".nvm/versions/node"),
+                os.path.join(home, ".fnm/node-versions"),
+                os.path.join(home, ".local/share/fnm/node-versions"),
+                os.path.join(home, ".volta/bin"),
+                os.path.join(home, ".npm-global/bin"),
+                "/usr/local/lib/node_modules/.bin",
+            ]
+        else:
+            # Windows common locations
+            appdata = os.environ.get("APPDATA", "")
+            common_dirs = [
+                os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "nodejs"),
+                os.path.join(appdata, "npm") if appdata else "",
+                os.path.join(appdata, "nvm") if appdata else "",
+                os.path.join(home, ".volta", "bin"),
+            ]
+        
+        for d in common_dirs:
+            if not d or not os.path.isdir(d):
+                # For nvm/fnm, search version subdirectories
+                if "nvm/versions/node" in d or "fnm" in d:
+                    parent = d
+                    if os.path.isdir(parent):
+                        try:
+                            versions = sorted(os.listdir(parent), reverse=True)
+                            for v in versions:
+                                bin_dir = os.path.join(parent, v, "bin")
+                                candidate = os.path.join(bin_dir, name)
+                                if sys.platform == "win32":
+                                    for ext in [".cmd", ".exe", ""]:
+                                        if os.path.isfile(candidate + ext):
+                                            return candidate + ext
+                                elif os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                                    return candidate
+                        except Exception:
+                            pass
+                continue
+            
+            candidate = os.path.join(d, name)
+            if sys.platform == "win32":
+                for ext in [".cmd", ".exe", ""]:
+                    if os.path.isfile(candidate + ext):
+                        return candidate + ext
+            else:
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    return candidate
+            
+            # Also check nvm/fnm version subdirs if this is a version root
+            if "nvm/versions/node" in d or "fnm" in d:
+                try:
+                    versions = sorted(os.listdir(d), reverse=True)
+                    for v in versions:
+                        bin_dir = os.path.join(d, v, "bin")
+                        candidate = os.path.join(bin_dir, name)
+                        if sys.platform == "win32":
+                            for ext in [".cmd", ".exe", ""]:
+                                if os.path.isfile(candidate + ext):
+                                    return candidate + ext
+                        elif os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                            return candidate
+                except Exception:
+                    pass
+        
+        return None
 
     # First check Node.js
-    try:
-        node_result = subprocess.run(
-            [which_cmd, "node"],
-            capture_output=True, text=True, timeout=10,
-            encoding='utf-8', errors='replace'
-        )
-        if node_result.returncode != 0:
-            return False, "Node.js 未安装，请先安装最新版 Node.js (https://nodejs.org/)，然后运行: npm install -g copilot-api"
-    except Exception:
-        return False, "Node.js 未安装，请先安装最新版 Node.js (https://nodejs.org/)，然后运行: npm install -g copilot-api"
+    node_path = _find_executable("node")
+    if not node_path:
+        return False, "Node.js 未安装。请安装 Node.js (https://nodejs.org/)，然后运行: npm install -g copilot-api\n如果已安装但未检测到，可能是 PATH 未包含 Node.js 路径（常见于 nvm/fnm 环境）。"
 
     # Then check copilot-api
-    try:
-        result = subprocess.run(
-            [which_cmd, "copilot-api"],
-            capture_output=True, text=True, timeout=10,
-            encoding='utf-8', errors='replace'
-        )
-        if result.returncode == 0:
-            path = result.stdout.strip().split('\n')[0].strip()
-            return True, path
-        return False, "copilot-api 未找到，请运行: npm install -g copilot-api"
-    except Exception as e:
-        return False, f"检测 copilot-api 失败: {e}"
+    copilot_path = _find_executable("copilot-api")
+    if not copilot_path:
+        return False, f"Node.js 已找到 ({node_path})，但 copilot-api 未安装。请运行: npm install -g copilot-api"
+    
+    return True, copilot_path
 
 
 def check_copilot_api_running(api_url=None):
@@ -141,18 +246,22 @@ def check_copilot_api_running(api_url=None):
         return False, f"copilot-api 服务异常 (HTTP {status}): {body[:200]}"
 
 
-def start_copilot_api():
+def start_copilot_api(copilot_path=None):
     """Start copilot-api service in background.
     Returns (success: bool, message: str, process_or_none).
     
+    Args:
+        copilot_path: Full path to copilot-api executable. If None, uses "copilot-api" from PATH.
+    
     Captures initial output to detect login requirements.
     """
+    cmd = copilot_path or "copilot-api"
     try:
         # Start copilot-api as a background process
         if sys.platform == "win32":
             # On Windows, use CREATE_NEW_PROCESS_GROUP to detach
             proc = subprocess.Popen(
-                ["copilot-api", "start"],
+                [cmd, "start"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
@@ -163,7 +272,7 @@ def start_copilot_api():
             )
         else:
             proc = subprocess.Popen(
-                ["copilot-api", "start"],
+                [cmd, "start"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
@@ -235,7 +344,7 @@ def start_copilot_api():
         return False, f"copilot-api 已启动但服务未就绪:\n{full_output}", proc
 
     except FileNotFoundError:
-        return False, "copilot-api 命令未找到，请先安装最新版 Node.js，然后运行: npm install -g copilot-api", None
+        return False, f"copilot-api 命令未找到 ({cmd})。请确认安装路径正确，或手动指定 API 地址。", None
     except Exception as e:
         return False, f"启动 copilot-api 失败: {e}", None
 

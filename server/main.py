@@ -27,7 +27,7 @@ from xml.etree import ElementTree as ET
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 # Power version — used in MCP server info and JSON reports
-POWER_VERSION = "1.6.1"
+POWER_VERSION = "1.6.2"
 
 # ============================================================
 # Auto-install helper
@@ -3119,6 +3119,7 @@ def handle_configure_llm_api(args):
         )}], "copilot_installed": False}
 
     msg_lines.append(f"✓ copilot-api 已安装: {install_info}")
+    copilot_path = install_info  # install_info is the full path when installed=True
 
     # Step 2: Check if service is already running
     running, _run_msg = check_copilot_api_running()
@@ -3145,7 +3146,7 @@ def handle_configure_llm_api(args):
 
     # Step 3: Start copilot-api
     msg_lines.append("正在启动 copilot-api 服务...")
-    ok, start_msg, _proc = start_copilot_api()
+    ok, start_msg, _proc = start_copilot_api(copilot_path)
 
     if ok:
         msg_lines.append("✓ copilot-api 服务已启动")
