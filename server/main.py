@@ -124,6 +124,11 @@ CACHE_IMAGE_PROGRESS = "image_progress.json"
 CACHE_TESTCASES = "testcases.json"
 CACHE_DOC_SUMMARY = "doc_summary.json"
 
+# Common message constants
+_MSG_CONFIG_DONE = "配置完成，可以调用 process_images_with_llm 开始处理图片。"
+_MSG_MODEL = "  模型: gpt-4o"
+_MSG_THREADS = "  多线程: 启用 (8 线程)"
+
 # ============================================================
 # Cache / Persistence Layer
 # ============================================================
@@ -1298,12 +1303,16 @@ TOOLS = [
     },
     {
         "name": "export_xmind",
-        "description": "Export test cases to XMind format. File named as 需求名_testCase.xmind by default.",
+        "description": "Export test cases to XMind format. File named as 需求名_testCase.xmind by default. Also auto-generates JSON report and uploads to COS.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "output_path": {"type": "string", "description": "Output file path (default: 需求名_testCase.xmind)"},
-                "requirement_name": {"type": "string", "description": "Requirement name for file naming (auto-detected from docs if not provided)"}
+                "requirement_name": {"type": "string", "description": "Requirement name for file naming (auto-detected from docs if not provided)"},
+                "agent_model": {"type": "string", "description": "Agent model name (e.g. Claude Opus 4.6), reported by agent"},
+                "credits_used": {"type": "number", "description": "Kiro credits consumed, manually provided by user"},
+                "elapsed_time": {"type": "string", "description": "Elapsed time string, manually provided by user (e.g. '1m 45s')"},
+                "report_only": {"type": "boolean", "description": "If true, skip iteration counter increment (use for credit/report updates only)"}
             },
             "required": []
         }
@@ -2212,7 +2221,6 @@ def handle_delete_module(args):
         return {"content": [{"type": "text", "text": "错误: 必须提供 module_names 参数（模块名称列表）"}]}
 
     target_keys = {n.strip().lower() for n in module_names}
-    before_count = len(testcase_store["modules"])
     removed = []
     kept = []
     for m in testcase_store["modules"]:
@@ -2513,6 +2521,208 @@ def handle_export_report(args):
         return {"content": [{"type": "text", "text": f"报告生成失败: {e}\n\n报告内容:\n{report_content}"}]}
 
 
+# ============================================================
+# Hardcoded COS config for auto-upload
+# ============================================================
+_COS_SECRET_ID = "AKIDqY5ZqwqY3KSN5bw65qNjspa8TdcOwGPK"
+_COS_SECRET_KEY = "rVwGRPAj9ORHtJZcYGm7HDxWr0ve9Rj3"
+_COS_REGION = "ap-guangzhou"
+_COS_BUCKET = "stock-report-bucket-1385219702"
+_COS_PREFIX = "Testcase_reports/"
+
+
+def _auto_generate_and_upload_report(req_name, args, iteration_count):
+    """Generate JSON report with stable filename and upload to COS.
+
+    Called automatically from handle_export_xmind so every xmind export
+    (initial or iteration) produces and uploads a report.
+    The report filename is '{req_name}_report.json' (no timestamp) so that
+    repeated uploads always overwrite the same COS object.
+    """
+    import datetime
+
+    modules = testcase_store["modules"]
+    agent_model = args.get("agent_model", "")
+    credits_used = args.get("credits_used")
+    elapsed_time = args.get("elapsed_time", "")
+
+    # --- agent_info ---
+    agent_info = {"platform": "Kiro"}
+    if agent_model:
+        agent_info["model_name"] = agent_model
+    if credits_used is not None:
+        agent_info["credits_used"] = credits_used
+    if elapsed_time:
+        agent_info["elapsed_time"] = elapsed_time
+
+    # --- documents ---
+    md_files = testcase_store.get("md_files", [])
+    if not md_files:
+        _restore_store_from_cache()
+        md_files = testcase_store.get("md_files", [])
+
+    doc_files = []
+    primary_count = 0
+    reference_count = 0
+    for mf in md_files:
+        role = mf.get("role", "primary")
+        if role == "primary":
+            primary_count += 1
+        else:
+            reference_count += 1
+        doc_files.append({
+            "filename": mf.get("source_filename", mf.get("name", "")),
+            "role": role,
+            "tag": mf.get("tag"),
+            "file_size_bytes": mf.get("file_size_bytes", 0),
+            "md_filename": mf.get("name", ""),
+        })
+
+    documents = {
+        "total_count": len(md_files),
+        "primary_count": primary_count,
+        "reference_count": reference_count,
+        "files": doc_files,
+    }
+
+    # --- image_processing ---
+    phase_state = _load_cache(CACHE_PHASE_STATE, {})
+    img_phase = phase_state.get("phases", {}).get("image_analysis", {})
+
+    llm_config_info = {}
+    try:
+        helper_dir = os.path.dirname(os.path.abspath(__file__))
+        if helper_dir not in sys.path:
+            sys.path.insert(0, helper_dir)
+        from copilot_api_helper import load_config as load_llm_config
+        config = load_llm_config(_workspace())
+        llm_config_info = {
+            "api_url": config.get("api_url", ""),
+            "model": config.get("model", ""),
+            "multithreading": config.get("enable_multithreading", False),
+            "max_threads": config.get("max_threads", 3),
+        }
+    except Exception:
+        pass
+
+    total_images = img_phase.get("total", 0)
+    processed_images = img_phase.get("processed", 0)
+    skipped_images = img_phase.get("skipped", 0)
+    token_usage_data = img_phase.get("token_usage", {})
+
+    image_processing = {
+        "total_images": total_images,
+        "processed": processed_images,
+        "skipped": skipped_images,
+        "failed": max(0, total_images - processed_images),
+    }
+    if llm_config_info:
+        image_processing["llm_config"] = llm_config_info
+    if token_usage_data and any(v > 0 for v in token_usage_data.values()):
+        tp = token_usage_data.get("total_tokens", 0)
+        image_processing["token_usage"] = {
+            "total_prompt_tokens": token_usage_data.get("prompt_tokens", 0),
+            "total_completion_tokens": token_usage_data.get("completion_tokens", 0),
+            "total_tokens": tp,
+            "per_image_avg_tokens": round(tp / processed_images) if processed_images > 0 else 0,
+        }
+
+    # --- testcase_summary ---
+    total_cases = sum(len(s.get("test_cases", []))
+                      for m in modules for s in m.get("sub_modules", []))
+    total_subs = sum(len(m.get("sub_modules", [])) for m in modules)
+
+    module_list = []
+    for m in modules:
+        subs = m.get("sub_modules", [])
+        mc = sum(len(s.get("test_cases", [])) for s in subs)
+        module_list.append({
+            "name": m["name"],
+            "sub_module_count": len(subs),
+            "case_count": mc,
+        })
+
+    all_dims = dict.fromkeys(_COVERAGE_DIMS, 0)
+    for m in modules:
+        for s in m.get("sub_modules", []):
+            for c in s.get("test_cases", []):
+                for dim in _classify_case_dimensions(c):
+                    all_dims[dim] += 1
+
+    coverage = {}
+    for dim, count in sorted(all_dims.items(), key=lambda x: -x[1]):
+        pct = f"{count / total_cases * 100:.1f}%" if total_cases > 0 else "0%"
+        coverage[dim] = {"count": count, "percentage": pct}
+
+    testcase_summary = {
+        "requirement_name": req_name,
+        "module_count": len(modules),
+        "sub_module_count": total_subs,
+        "total_cases": total_cases,
+        "modules": module_list,
+        "coverage_dimensions": coverage,
+    }
+
+    # --- iteration feedbacks ---
+    iteration_feedbacks = _load_cache(CACHE_ITERATION_FEEDBACKS, [])
+
+    # --- assemble report ---
+    report = {
+        "report_version": POWER_VERSION,
+        "report_id": f"{req_name}_report",
+        "generated_at": datetime.datetime.now().isoformat(timespec='seconds'),
+        "iteration_count": iteration_count,
+        "iteration_feedbacks": iteration_feedbacks,
+        "agent_info": agent_info,
+        "documents": documents,
+        "image_processing": image_processing,
+        "testcase_summary": testcase_summary,
+    }
+
+    # Stable filename — no timestamp, so COS always overwrites the same object
+    report_filename = f"{req_name}_report.json"
+    report_path = os.path.join(_workspace(), report_filename)
+
+    with open(report_path, 'w', encoding='utf-8') as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    # --- Upload to COS ---
+    upload_msg = _upload_file_to_cos(report_path, report_filename)
+    return f"✓ JSON 报告已生成: {report_filename} | {upload_msg}"
+
+
+def _upload_file_to_cos(file_path, filename):
+    """Upload a file to COS using hardcoded credentials. Returns status message."""
+    if not _ensure_pkg("cos-python-sdk-v5"):
+        return "COS SDK 安装失败，跳过上传"
+
+    from qcloud_cos import CosConfig, CosS3Client
+
+    cos_key = f"{_COS_PREFIX}{filename}"
+
+    try:
+        config = CosConfig(
+            Region=_COS_REGION,
+            SecretId=_COS_SECRET_ID,
+            SecretKey=_COS_SECRET_KEY,
+        )
+        client = CosS3Client(config)
+
+        with open(file_path, 'rb') as fp:
+            client.put_object(
+                Bucket=_COS_BUCKET,
+                Body=fp,
+                Key=cos_key,
+                ContentType='application/json',
+            )
+
+        return "COS 上传成功"
+    except Exception as e:
+        sys.stderr.write(f"[MCP] COS upload error: {e}\n")
+        sys.stderr.flush()
+        return f"COS 上传失败: {e}"
+
+
 def handle_export_xmind(args):
     if not testcase_store["modules"]:
         _restore_store_from_cache()
@@ -2529,17 +2739,32 @@ def handle_export_xmind(args):
         total = sum(len(s.get("test_cases", [])) for m in testcase_store["modules"]
                     for s in m.get("sub_modules", []))
 
-        # Increment iteration counter (each xmind export = one iteration)
+        # Increment iteration counter only if not a report-only update
         phase_state = _load_cache(CACHE_PHASE_STATE, {})
-        iteration_count = phase_state.get("iteration_count", 0) + 1
-        phase_state["iteration_count"] = iteration_count
-        _save_cache(CACHE_PHASE_STATE, phase_state)
+        if not args.get("report_only"):
+            iteration_count = phase_state.get("iteration_count", 0) + 1
+            phase_state["iteration_count"] = iteration_count
+            _save_cache(CACHE_PHASE_STATE, phase_state)
+        else:
+            iteration_count = phase_state.get("iteration_count", 1)
 
         _save_phase_state("export", "completed")
-        return {"content": [{"type": "text", "text": f"Exported: {p}\n{len(testcase_store['modules'])} modules, {total} cases\nIteration: {iteration_count}"}],
+
+        # --- Auto-generate JSON report and upload to COS ---
+        cos_report_msg = ""
+        try:
+            cos_report_msg = _auto_generate_and_upload_report(req_name, args, iteration_count)
+        except Exception as e:
+            sys.stderr.write(f"[MCP] Auto report/upload error: {e}\n")
+            sys.stderr.flush()
+            cos_report_msg = f"(报告上传跳过: {e})"
+
+        return {"content": [{"type": "text", "text": f"Exported: {p}\n{len(testcase_store['modules'])} modules, {total} cases\nIteration: {iteration_count}\n{cos_report_msg}"}],
                 "xmind_path": p, "requirement_name": req_name, "iteration_count": iteration_count}
     except Exception as e:
         return {"content": [{"type": "text", "text": f"Export failed: {e}"}]}
+
+
 
 
 def handle_export_json_report(args):
@@ -2769,14 +2994,13 @@ def handle_upload_to_cos(args):
         client = CosS3Client(config)
 
         with open(file_path, 'rb') as fp:
-            response = client.put_object(
+            client.put_object(
                 Bucket=bucket,
                 Body=fp,
                 Key=cos_key,
                 ContentType='application/json',
             )
 
-        etag = response.get('ETag', '')
         cos_url = f"https://{bucket}.cos.{region}.myqcloud.com/{cos_key}"
 
         return {
@@ -2872,13 +3096,13 @@ def handle_configure_llm_api(args):
             "✓ LLM API 配置已保存（手动指定模式）:",
             f"  API 地址: {explicit_url}",
             f"  API Key: {'已设置' if explicit_key else '未设置'}",
-            f"  模型: gpt-4o",
-            f"  多线程: 启用 (8 线程)",
+            _MSG_MODEL,
+            _MSG_THREADS,
         ]
         if test_msg:
             msg_lines.append(test_msg)
         msg_lines.append("")
-        msg_lines.append("配置完成，可以调用 process_images_with_llm 开始处理图片。")
+        msg_lines.append(_MSG_CONFIG_DONE)
         return {"content": [{"type": "text", "text": "\n".join(msg_lines)}], "config": config}
 
     # --- copilot-api auto-config flow ---
@@ -2897,9 +3121,9 @@ def handle_configure_llm_api(args):
     msg_lines.append(f"✓ copilot-api 已安装: {install_info}")
 
     # Step 2: Check if service is already running
-    running, run_msg = check_copilot_api_running()
+    running, _run_msg = check_copilot_api_running()
     if running:
-        msg_lines.append(f"✓ copilot-api 服务已运行")
+        msg_lines.append("✓ copilot-api 服务已运行")
         # Save config and return
         api_url = DEFAULT_COPILOT_API_URL
         config = {
@@ -2912,16 +3136,16 @@ def handle_configure_llm_api(args):
         save_config(config, workspace)
         msg_lines.extend([
             f"  API 地址: {api_url}",
-            "  模型: gpt-4o",
-            "  多线程: 启用 (8 线程)",
+            _MSG_MODEL,
+            _MSG_THREADS,
             "",
-            "配置完成，可以调用 process_images_with_llm 开始处理图片。"
+            _MSG_CONFIG_DONE
         ])
         return {"content": [{"type": "text", "text": "\n".join(msg_lines)}], "config": config}
 
     # Step 3: Start copilot-api
     msg_lines.append("正在启动 copilot-api 服务...")
-    ok, start_msg, proc = start_copilot_api()
+    ok, start_msg, _proc = start_copilot_api()
 
     if ok:
         msg_lines.append("✓ copilot-api 服务已启动")
@@ -2936,10 +3160,10 @@ def handle_configure_llm_api(args):
         save_config(config, workspace)
         msg_lines.extend([
             f"  API 地址: {api_url}",
-            "  模型: gpt-4o",
-            "  多线程: 启用 (8 线程)",
+            _MSG_MODEL,
+            _MSG_THREADS,
             "",
-            "配置完成，可以调用 process_images_with_llm 开始处理图片。"
+            _MSG_CONFIG_DONE
         ])
         return {"content": [{"type": "text", "text": "\n".join(msg_lines)}], "config": config}
 
