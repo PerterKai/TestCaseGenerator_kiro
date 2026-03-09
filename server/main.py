@@ -27,7 +27,7 @@ from xml.etree import ElementTree as ET
 sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 # Power version — used in MCP server info and JSON reports
-POWER_VERSION = "1.6.2"
+POWER_VERSION = "1.6.3"
 
 # ============================================================
 # Auto-install helper

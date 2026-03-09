@@ -91,19 +91,37 @@ def _http_request(url, method="GET", data=None, headers=None, timeout=15):
         return 0, str(e)
 
 
+
 def check_copilot_api_installed():
     """Check if copilot-api CLI is installed. Also checks Node.js prerequisite.
     Returns (installed: bool, path_or_error: str).
-    
+
     Searches both PATH and common installation directories to handle
     environments where PATH is incomplete (e.g., MCP server subprocess,
     nvm/fnm managed Node.js, GUI-launched processes on macOS).
     """
-    
+
+    def _resolve_windows_ext(path):
+        """On Windows, ensure the path has the actual file extension (.cmd/.exe).
+        `where` sometimes returns paths without extension; we need the real file."""
+        if sys.platform != "win32" or not path:
+            return path
+        # If path already has a known extension and exists, return as-is
+        _, ext = os.path.splitext(path)
+        if ext.lower() in ('.cmd', '.exe', '.bat', '.ps1') and os.path.isfile(path):
+            return path
+        # Try adding common extensions
+        for try_ext in ['.cmd', '.exe', '.bat', '']:
+            candidate = path + try_ext if try_ext else path
+            if os.path.isfile(candidate):
+                return candidate
+        # Return original if nothing found (let caller handle)
+        return path
+
     def _find_executable(name):
         """Find an executable by name. Tries PATH first, then common locations."""
         which_cmd = "where" if sys.platform == "win32" else "which"
-        
+
         # 1. Try standard PATH lookup
         try:
             result = subprocess.run(
@@ -114,26 +132,40 @@ def check_copilot_api_installed():
             if result.returncode == 0:
                 path = result.stdout.strip().split('\n')[0].strip()
                 if path:
-                    return path
+                    return _resolve_windows_ext(path)
         except Exception:
             pass
-        
-        # 2. Try running directly (may work if shell profile sets PATH)
+
+        # 2. Try running directly via shell (handles .cmd/.bat on Windows)
         try:
-            result = subprocess.run(
-                [name, "--version"],
-                capture_output=True, text=True, timeout=10,
-                encoding='utf-8', errors='replace'
-            )
+            if sys.platform == "win32":
+                # On Windows, .cmd scripts need shell=True to execute
+                result = subprocess.run(
+                    f'{name} --version',
+                    capture_output=True, text=True, timeout=10,
+                    encoding='utf-8', errors='replace',
+                    shell=True
+                )
+            else:
+                result = subprocess.run(
+                    [name, "--version"],
+                    capture_output=True, text=True, timeout=10,
+                    encoding='utf-8', errors='replace'
+                )
             if result.returncode == 0:
+                # Found via shell — on Windows, try to resolve full path
+                if sys.platform == "win32":
+                    # Use `where` one more time or just return the name
+                    # (shell=True in start_copilot_api will handle it)
+                    return name
                 return name  # Found in some PATH
         except Exception:
             pass
-        
+
         # 3. Search common installation directories
         home = os.path.expanduser("~")
         common_dirs = []
-        
+
         if sys.platform == "darwin":
             # macOS common locations
             common_dirs = [
@@ -167,7 +199,7 @@ def check_copilot_api_installed():
                 os.path.join(appdata, "nvm") if appdata else "",
                 os.path.join(home, ".volta", "bin"),
             ]
-        
+
         for d in common_dirs:
             if not d or not os.path.isdir(d):
                 # For nvm/fnm, search version subdirectories
@@ -188,7 +220,7 @@ def check_copilot_api_installed():
                         except Exception:
                             pass
                 continue
-            
+
             candidate = os.path.join(d, name)
             if sys.platform == "win32":
                 for ext in [".cmd", ".exe", ""]:
@@ -197,7 +229,7 @@ def check_copilot_api_installed():
             else:
                 if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
                     return candidate
-            
+
             # Also check nvm/fnm version subdirs if this is a version root
             if "nvm/versions/node" in d or "fnm" in d:
                 try:
@@ -213,7 +245,7 @@ def check_copilot_api_installed():
                             return candidate
                 except Exception:
                     pass
-        
+
         return None
 
     # First check Node.js
@@ -225,8 +257,10 @@ def check_copilot_api_installed():
     copilot_path = _find_executable("copilot-api")
     if not copilot_path:
         return False, f"Node.js 已找到 ({node_path})，但 copilot-api 未安装。请运行: npm install -g copilot-api"
-    
+
     return True, copilot_path
+
+
 
 
 def check_copilot_api_running(api_url=None):
@@ -259,16 +293,25 @@ def start_copilot_api(copilot_path=None):
     try:
         # Start copilot-api as a background process
         if sys.platform == "win32":
-            # On Windows, use CREATE_NEW_PROCESS_GROUP to detach
-            proc = subprocess.Popen(
-                [cmd, "start"],
+            # On Windows, ALWAYS use shell=True.
+            # npm-installed CLI tools (like copilot-api) are .cmd scripts.
+            # Running .cmd without shell=True causes WinError 193.
+            # Using shell=True universally on Windows is safe and avoids all edge cases.
+            popen_kwargs = dict(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+            # Quote the path in case it contains spaces
+            shell_cmd = f'"{cmd}" start'
+            proc = subprocess.Popen(
+                shell_cmd,
+                shell=True,
+                **popen_kwargs
             )
         else:
             proc = subprocess.Popen(
