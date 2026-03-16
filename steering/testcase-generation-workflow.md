@@ -27,7 +27,7 @@ COS 上传参数已硬编码在 `export_xmind` 函数内部，每次导出 XMind
 ### 阶段0: 环境检查与任务决策（每次启动必做）
 
 1. 调用 `setup_environment` 执行启动检查
-2. 工具自动完成：依赖检查 → 目录创建 → copilot-api 环境检查 → 缓存任务检测
+2. 工具自动完成：依赖检查 → 目录创建（含 skill/）→ copilot-api 环境检查 → 缓存任务检测 → 业务 Skill 检测
 3. 根据返回结果决定后续流程：
 
 **如果 `has_cache=true`（检测到缓存任务）：**
@@ -97,10 +97,15 @@ COS 上传参数已硬编码在 `export_xmind` 函数内部，每次导出 XMind
 图片处理完成后，建议开启新 session 进行用例生成，以获得最大上下文空间。
 
 1. 调用 `setup_environment` → 检测到缓存 → 用户选择"继续" → 调用 `get_workflow_state` 恢复进度
-2. 调用 `get_doc_summary` 获取文档结构概览（标题树 + 字数统计），文档按主文档/辅助资料分类显示
-3. 优先按主文档的模块分批生成用例：
+2. **加载业务 Skill**（如 `setup_environment` 返回 `has_skills=true`）：
+   - 调用 `get_skills()` 加载所有 Skill 内容
+   - Skill 中的测试要点和 Checklist 将作为用例生成的补充依据
+   - 在后续每个模块生成时，对照 Skill Checklist 逐项检查是否需要覆盖
+3. 调用 `get_doc_summary` 获取文档结构概览（标题树 + 字数统计），文档按主文档/辅助资料分类显示
+4. 优先按主文档的模块分批生成用例：
    a. 调用 `get_doc_section(doc_name, section_heading)` 读取主文档中一个模块的内容
    b. 基于该模块内容生成测试用例
+      - **如果已加载 Skill，必须对照 Skill Checklist 逐项检查**：该模块是否涉及多币种/汇率？是否有编辑/暂存入口？是否调用外部系统？是否有必填字段？是否涉及金额计算？是否引用了外部对象？命中的项目必须生成对应用例
    c. 如果用例设计中需要补充信息（如关联的数据结构定义、接口规范等），再按需从辅助资料中调用 `get_doc_section` 查阅对应章节
    d. 调用 `save_testcases(append_module=该模块的完整JSON对象)` 增量保存该模块用例
       - **必须传递 `append_module` 参数**（单个模块对象，非数组），不能省略
@@ -216,6 +221,7 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 - **优先使用 `get_module(module_name=...)` 逐模块查看**，避免 `get_testcases` 全量加载占满上下文
 - **每轮都使用 `append_module` 逐模块更新**，按模块名自动替换已有同名模块
 - **删除模块使用 `delete_module(module_names=[...])`**，无需全量替换
+- **如果已加载 Skill，Review 时也需对照 Skill Checklist 检查覆盖**，确保 Skill 中的高频缺陷场景在用例中有对应覆盖
 - 不需要修改的模块无需重新提交，避免全量提交导致参数截断
 - **在 Review 过程中，记录发现的需求疑问点和确认项**，用于最终报告
 
@@ -318,6 +324,7 @@ XMind 导出层级（链式嵌套，每层单子节点）：
 - `image_progress.json` — 图片处理进度
 - `testcases.json` — 已生成的测试用例
 - `doc_summary.json` — 文档结构摘要
+- `skills.json` — 已加载的 Skill 元数据
 
 新 session 中调用 `setup_environment` 即可检测缓存任务，询问用户后决定恢复或重新开始。
 

@@ -123,6 +123,7 @@ CACHE_PHASE_STATE = "phase_state.json"
 CACHE_IMAGE_PROGRESS = "image_progress.json"
 CACHE_TESTCASES = "testcases.json"
 CACHE_DOC_SUMMARY = "doc_summary.json"
+CACHE_SKILLS = "skills.json"
 
 # Common message constants
 _MSG_CONFIG_DONE = "配置完成，可以调用 process_images_with_llm 开始处理图片。"
@@ -1195,13 +1196,113 @@ def create_xmind_file(modules, output_path):
     return output_path
 
 # ============================================================
+# Skill Loading
+# ============================================================
+
+def _load_skills_from_dir():
+    """Load all .md skill files from skill/ directory.
+    
+    Returns list of {name, filename, content, char_count}.
+    """
+    workspace = _workspace()
+    skill_dir = os.path.join(workspace, "skill")
+    skills = []
+    if not os.path.isdir(skill_dir):
+        return skills
+    for fname in sorted(os.listdir(skill_dir)):
+        if not fname.lower().endswith('.md'):
+            continue
+        fpath = os.path.join(skill_dir, fname)
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            name = os.path.splitext(fname)[0]
+            skills.append({
+                "name": name,
+                "filename": fname,
+                "content": content,
+                "char_count": len(content),
+            })
+        except Exception as e:
+            sys.stderr.write(f"[MCP] Warning: failed to read skill {fname}: {e}\n")
+            sys.stderr.flush()
+    return skills
+
+
+def handle_get_skills(args):
+    """Load business skills from skill/ directory.
+    
+    If skill_name is provided, return only that skill's full content.
+    Otherwise, return a summary list of all skills with previews.
+    """
+    skill_name = args.get("skill_name", "")
+    skills = _load_skills_from_dir()
+
+    if not skills:
+        return {"content": [{"type": "text", "text": (
+            "📚 skill/ 目录下没有找到 .md 文件。\n"
+            "可在 skill/ 目录放置业务经验 Skill 文件（.md 格式），用例生成时将自动加载作为补充依据。"
+        )}], "skill_count": 0}
+
+    # Cache skill metadata for report
+    skill_meta = [{"name": s["name"], "filename": s["filename"], "char_count": s["char_count"]} for s in skills]
+    _save_cache(CACHE_SKILLS, skill_meta)
+
+    if skill_name:
+        # Return specific skill content
+        target = None
+        for s in skills:
+            if s["name"] == skill_name or s["filename"] == skill_name:
+                target = s
+                break
+        # Fuzzy match
+        if not target:
+            for s in skills:
+                if skill_name.lower() in s["name"].lower() or skill_name.lower() in s["filename"].lower():
+                    target = s
+                    break
+        if not target:
+            available = [s["filename"] for s in skills]
+            return {"content": [{"type": "text", "text": (
+                f"未找到 Skill: '{skill_name}'\n可用 Skill:\n" +
+                "\n".join(f"  - {a}" for a in available)
+            )}]}
+        return {
+            "content": [{"type": "text", "text": (
+                f"📚 Skill: {target['name']}\n"
+                f"文件: {target['filename']} ({target['char_count']} 字符)\n\n"
+                f"{target['content']}"
+            )}],
+            "skill_name": target["name"],
+            "char_count": target["char_count"],
+        }
+
+    # Return all skills content (for typical use: load all at once before generation)
+    lines = [f"📚 业务 Skill 加载完成: 共 {len(skills)} 个\n"]
+    for s in skills:
+        lines.append(f"{'='*60}")
+        lines.append(f"📖 Skill: {s['name']} ({s['char_count']} 字符)")
+        lines.append(f"{'='*60}")
+        lines.append(s["content"])
+        lines.append("")
+
+    lines.append(f"\n共加载 {len(skills)} 个 Skill，请在生成用例时对照 Skill 中的测试要点和 Checklist 逐项检查覆盖。")
+
+    return {
+        "content": [{"type": "text", "text": "\n".join(lines)}],
+        "skill_count": len(skills),
+        "skills": skill_meta,
+    }
+
+
+# ============================================================
 # MCP Tool Definitions
 # ============================================================
 
 TOOLS = [
     {
         "name": "setup_environment",
-        "description": "启动检查: 1) 检查并安装Python依赖 2) 检查并创建工作目录(doc/, .tmp/doc_mk/, .tmp/picture/, .tmp/cache/) 3) 轻量检测copilot-api是否已安装 4) 检测缓存任务。如检测到缓存任务，返回 has_cache=true 和缓存详情，agent 需询问用户是继续上次任务还是开始新任务。",
+        "description": "启动检查: 1) 检查并安装Python依赖 2) 检查并创建工作目录(doc/, skill/, .tmp/doc_mk/, .tmp/picture/, .tmp/cache/) 3) 轻量检测copilot-api是否已安装 4) 检测缓存任务 5) 检测业务Skill。如检测到缓存任务，返回 has_cache=true 和缓存详情，agent 需询问用户是继续上次任务还是开始新任务。如检测到 skill/ 下有 .md 文件，返回 has_skills=true。",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
     },
     {
@@ -1256,6 +1357,17 @@ TOOLS = [
         "name": "get_parsed_markdown",
         "description": "Read all processed markdown files. WARNING: may be large. Prefer get_doc_summary + get_doc_section for large documents to avoid context overflow.",
         "inputSchema": {"type": "object", "properties": {}, "required": []}
+    },
+    {
+        "name": "get_skills",
+        "description": "加载 skill/ 目录下的业务经验 Skill 文件（.md 格式）。Skill 沉淀了历史缺陷经验和测试要点，用例生成时应对照 Skill 中的 Checklist 逐项检查覆盖。不传 skill_name 则返回所有 Skill 内容；传 skill_name 则返回指定 Skill。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "skill_name": {"type": "string", "description": "Skill 名称或文件名（可选，不传则返回全部 Skill）"}
+            },
+            "required": []
+        }
     },
     {
         "name": "save_testcases",
@@ -1435,6 +1547,7 @@ def handle_setup_environment(args):
     workspace = _workspace()
     dirs_to_check = {
         "doc": os.path.join(workspace, "doc"),
+        "skill": os.path.join(workspace, "skill"),
         ".tmp/doc_mk": TMP_DOC_DIR,
         ".tmp/picture": TMP_PIC_DIR,
         ".tmp/cache": TMP_CACHE_DIR,
@@ -1513,6 +1626,24 @@ def handle_setup_environment(args):
         results.append("  1. 继续上次任务 — 调用 get_workflow_state 恢复进度")
         results.append("  2. 开始新任务 — 调用 clear_cache 清除缓存后开始新的用例生成")
 
+    # 5. Detect business skills
+    skill_dir = os.path.join(workspace, "skill")
+    skill_files = []
+    if os.path.isdir(skill_dir):
+        for fname in os.listdir(skill_dir):
+            if fname.lower().endswith('.md'):
+                skill_files.append(fname)
+    has_skills = len(skill_files) > 0
+    if has_skills:
+        results.append("")
+        results.append(f"📚 检测到业务 Skill: {len(skill_files)} 个")
+        for sf in skill_files:
+            results.append(f"  - {sf}")
+        results.append("  用例生成时将自动加载 skill 作为补充依据。")
+    else:
+        results.append("")
+        results.append("📚 业务 Skill: 无（可在 skill/ 目录放置 .md 文件沉淀业务经验）")
+
     results.append("")
     results.append("OK - environment ready" if all_ok else "WARN - some deps failed")
     return {
@@ -1521,6 +1652,8 @@ def handle_setup_environment(args):
         "has_cache": has_cache,
         "cache_info": cache_info,
         "copilot_installed": copilot_installed,
+        "has_skills": has_skills,
+        "skill_count": len(skill_files),
     }
 
 
@@ -1529,7 +1662,7 @@ def handle_clear_cache(args):
     cleared = []
 
     # Clear cache files
-    for cache_file in (CACHE_PHASE_STATE, CACHE_IMAGE_PROGRESS, CACHE_TESTCASES, CACHE_DOC_SUMMARY, CACHE_ITERATION_FEEDBACKS):
+    for cache_file in (CACHE_PHASE_STATE, CACHE_IMAGE_PROGRESS, CACHE_TESTCASES, CACHE_DOC_SUMMARY, CACHE_ITERATION_FEEDBACKS, CACHE_SKILLS):
         cache_fp = _cache_path(cache_file)
         if os.path.exists(cache_fp):
             os.remove(cache_fp)
@@ -2666,6 +2799,13 @@ def _auto_generate_and_upload_report(req_name, args, iteration_count):
     # --- iteration feedbacks ---
     iteration_feedbacks = _load_cache(CACHE_ITERATION_FEEDBACKS, [])
 
+    # --- skills ---
+    skill_meta = _load_cache(CACHE_SKILLS, [])
+    skills_info = {
+        "skill_count": len(skill_meta),
+        "skills": skill_meta,
+    }
+
     # --- assemble report ---
     report = {
         "report_version": POWER_VERSION,
@@ -2675,6 +2815,7 @@ def _auto_generate_and_upload_report(req_name, args, iteration_count):
         "iteration_feedbacks": iteration_feedbacks,
         "agent_info": agent_info,
         "documents": documents,
+        "skills": skills_info,
         "image_processing": image_processing,
         "testcase_summary": testcase_summary,
     }
@@ -2915,6 +3056,13 @@ def handle_export_json_report(args):
     # Load iteration feedbacks from cache
     iteration_feedbacks = _load_cache(CACHE_ITERATION_FEEDBACKS, [])
 
+    # --- skills ---
+    skill_meta = _load_cache(CACHE_SKILLS, [])
+    skills_info = {
+        "skill_count": len(skill_meta),
+        "skills": skill_meta,
+    }
+
     report = {
         "report_version": POWER_VERSION,
         "report_id": f"{req_name}_{report_ts}",
@@ -2923,6 +3071,7 @@ def handle_export_json_report(args):
         "iteration_feedbacks": iteration_feedbacks,
         "agent_info": agent_info,
         "documents": documents,
+        "skills": skills_info,
         "image_processing": image_processing,
         "testcase_summary": testcase_summary,
     }
@@ -3454,6 +3603,7 @@ HANDLERS = {
     "get_doc_summary": handle_get_doc_summary,
     "get_doc_section": handle_get_doc_section,
     "get_parsed_markdown": handle_get_parsed_markdown,
+    "get_skills": handle_get_skills,
     "save_testcases": handle_save_testcases,
     "get_testcases": handle_get_testcases,
     "get_module": handle_get_module,

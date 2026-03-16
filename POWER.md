@@ -29,6 +29,7 @@ keywords:
 - Markdown 文件中用 `{{IMG:唯一标识}}` 占位符标记图片原始位置
 - 图片通过 copilot-api (GitHub Copilot) 调用 gpt-4o 批量分析（支持多线程并发）
 - 分析结果直接写回 Markdown 文件，替换对应占位符
+- 支持业务 Skill 加载：`skill/` 目录下的 `.md` 文件沉淀了历史缺陷经验和测试要点，用例生成时自动加载作为补充依据
 - 所有工作流状态持久化到 `.tmp/cache/` 目录，支持跨 session 恢复
 - 外部LLM通过 copilot-api 自动配置（检查安装→启动服务→检查登录→自动获取API地址），配置持久化到 `.tmp/cache/llm_api_config.json`
 
@@ -40,11 +41,13 @@ keywords:
 1. **依赖检查**: 检查并安装 Python 依赖（python-docx, Pillow, openpyxl）
 2. **目录检查**: 检查工作目录是否存在，不存在则自动创建：
    - `doc/` — 存放 .docx 源文档
+   - `skill/` — 存放业务经验 Skill 文件（.md 格式）
    - `.tmp/doc_mk/` — 转换后的 Markdown 文件
    - `.tmp/picture/` — 提取的图片文件
    - `.tmp/cache/` — 工作流状态缓存
 3. **copilot-api 检查**: 轻量检测 copilot-api 是否已安装（启动和登录检查在用户选择图片模式后由 `configure_llm_api` 执行）
 4. **缓存任务检测**: 检查是否存在未完成的缓存任务
+5. **业务 Skill 检测**: 检查 `skill/` 目录下是否有 `.md` 文件，返回 `has_skills` 和 `skill_count`
 
 #### 缓存任务处理逻辑
 
@@ -120,10 +123,23 @@ keywords:
    - 处理进度自动持久化，支持断点续传
    - 如部分图片失败，可重新调用此工具重试
 
-### 步骤 4: 分段获取文档，按模块生成用例
+### 步骤 4: 加载 Skill + 分段获取文档，按模块生成用例
+
+#### 4.1 加载业务 Skill（如有）
+如果 `setup_environment` 返回 `has_skills=true`（或恢复任务时 `skill/` 目录下有文件）：
+1. 调用 `get_skills()` 加载所有业务 Skill 内容
+2. 将 Skill 中的测试要点和 Checklist 作为用例生成的补充依据
+3. 在后续每个模块的用例生成中，对照 Skill 中的问题类型逐一检查是否需要覆盖
+
+Skill 文件沉淀了历史缺陷经验（如汇率换算方向错误、编辑回显丢失、接口超时等），能针对性地补充文档中未明确提及但实际高频出现的缺陷场景。
+
+如果没有 Skill 文件，跳过此步骤，按常规维度生成用例。
+
+#### 4.2 分段读取文档并生成用例
 1. 调用 `get_doc_summary` 获取文档结构概览（标题树 + 字数统计），文档按主文档/辅助资料分类显示
 2. 优先按主文档的模块调用 `get_doc_section(doc_name, section_heading)` 分段读取
 3. 每读取一个模块的内容，就生成该模块的测试用例
+   - **如果已加载 Skill，必须对照 Skill 中的 Checklist 逐项检查**：该模块是否涉及多币种/汇率？是否有编辑/暂存入口？是否调用外部系统？是否有必填字段？是否涉及金额计算？是否引用了外部对象？命中的项目必须生成对应用例
 4. 如果用例设计中需要补充信息（如关联的数据结构定义、接口规范等），再按需从辅助资料中调用 `get_doc_section` 查阅对应章节
 5. 调用 `save_testcases(append_module=该模块的完整JSON对象)` 增量保存每个模块的用例
    - **`save_testcases` 必须提供 `modules`（全量数组）、`append_module`（单个模块对象）或 `file_path`（JSON文件路径）之一**
@@ -202,6 +218,7 @@ keywords:
 - **优先使用 `get_module(module_name=...)` 逐模块查看**，避免 `get_testcases` 全量加载占满上下文
 - 每轮使用 `append_module` 逐模块更新，不需要修改的模块无需重新提交
 - **删除模块使用 `delete_module(module_names=[...])`**，无需全量替换
+- **如果已加载 Skill，Review 时也需对照 Skill Checklist 检查覆盖**，确保 Skill 中的高频缺陷场景在用例中有对应覆盖
 - **大模块保存**：如果 `append_module` 因数据量过大被截断，改用 `file_path` 方式：
   1. `fsWrite` 写前50行到 `.tmp/cache/pending_module.json`
   2. `fsAppend` 逐段追加剩余内容（每次≤50行）
@@ -277,6 +294,7 @@ keywords:
 - `image_progress.json` — 图片处理进度
 - `testcases.json` — 已生成的测试用例
 - `doc_summary.json` — 文档结构摘要
+- `skills.json` — 已加载的 Skill 元数据
 
 新 session 中调用 `setup_environment` 即可检测缓存任务，询问用户后决定恢复或重新开始。
 
